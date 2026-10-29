@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""
+codex-switch: Gestor de multi-cuentas y reanudación de sesiones para OpenAI Codex CLI (codex).
+Permite alternar entre perfiles de autenticación locales,
+preservando el historial de la sesión intacto.
+"""
+
+import sys
+import os
+import json
+import base64
+import shutil
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+def validate_alias(nombre: str):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", nombre):
+        print("❌ Alias inválido: usa de 1 a 64 letras, números, puntos, guiones o guiones bajos; empieza con letra o número.")
+        sys.exit(2)
+
+
+def private_copy(source: Path, destination: Path):
+    # Crear el destino con permisos privados antes de escribir credenciales.
+    import tempfile
+    fd, temporary = tempfile.mkstemp(prefix=".profile-", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(source.read_bytes())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def get_base_dir() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    home = Path(os.environ.get("HOME", Path.home()))
+    return home / ".codex"
+
+def get_cuentas_dir() -> Path:
+    d = get_base_dir() / "cuentas"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    d.chmod(0o700)
+    return d
+
+def get_auth_path() -> Path:
+    return get_base_dir() / "auth.json"
+
+def decode_account_from_auth(auth_file: Path) -> str:
+    if not auth_file.is_file():
+        return "No configurada (sin auth.json)"
+    try:
+        data = json.loads(auth_file.read_text(encoding="utf-8"))
+        tokens = data.get("tokens", {})
+        id_token = tokens.get("id_token", "")
+        if id_token and "." in id_token:
+            payload = id_token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            jwt = json.loads(base64.urlsafe_b64decode(payload))
+            return jwt.get("email") or jwt.get("sub") or "Token sin email"
+        account_id = tokens.get("account_id")
+        if account_id:
+            return f"Account ID: {account_id}"
+        return data.get("auth_mode", "Modo auth desconocido")
+    except Exception as e:
+        return f"Error al decodificar: {e}"
+
+def get_most_recent_session_id() -> str:
+    index_file = get_base_dir() / "session_index.jsonl"
+    if not index_file.is_file():
+        return ""
+    try:
+        lines = [line.strip() for line in index_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not lines:
+            return ""
+        last_obj = json.loads(lines[-1])
+        return last_obj.get("id", "")
+    except Exception:
+        return ""
+
+def find_active_profile_name(cuentas_dir: Path, auth_path: Path) -> str:
+    if not auth_path.is_file():
+        return "(ninguna)"
+    try:
+        current_bytes = auth_path.read_bytes()
+    except Exception:
+        return "(desconocido)"
+
+    for f in cuentas_dir.glob("*.json"):
+        try:
+            if f.read_bytes() == current_bytes:
+                return f.stem
+        except Exception:
+            continue
+    return "(sin guardar / temporal)"
+
+def cmd_status():
+    auth_path = get_auth_path()
+    cuentas_dir = get_cuentas_dir()
+    account_info = decode_account_from_auth(auth_path)
+    active_profile = find_active_profile_name(cuentas_dir, auth_path)
+    last_sid = get_most_recent_session_id()
+
+    print("\n╭─────────────────────────────────────────────────────────────╮")
+    print("│  ✦ CODEX Multi-Cuenta · Gestor de Sesiones & Tokens         │")
+    print("╰─────────────────────────────────────────────────────────────╯")
+    print(f"  • Cuenta en disco: \033[1;32m{account_info}\033[0m")
+    print(f"  • Perfil guardado: \033[1;36m{active_profile}\033[0m")
+    if last_sid:
+        print(f"  • Última sesión  : \033[1;33m{last_sid}\033[0m")
+        print(f"    (Para continuar: codex-switch continuar  o  codex resume --last)")
+    else:
+        print(f"  • Última sesión  : (sin sesiones registradas)")
+
+    guardadas = list(cuentas_dir.glob("*.json"))
+    print(f"  • Credenciales   : {auth_path}")
+    print("  Aviso: este estado lee el archivo; no verifica la cuenta de procesos abiertos.")
+    print("  usar <nombre> reinicia el servidor persistente activo; reconecta la aplicación.")
+    print("\n  Cuentas disponibles:")
+    if not guardadas:
+        print("    (No hay cuentas guardadas todavía. Usa: codex-switch guardar <nombre>)")
+    else:
+        for f in sorted(guardadas):
+            p_name = f.stem
+            p_acc = decode_account_from_auth(f)
+            check = "★ [EN DISCO]" if p_name == active_profile else "  "
+            print(f"    {check} \033[1m{p_name:12}\033[0m → {p_acc}")
+
+    print("\n  Comandos frecuentes:")
+    print("    codex-switch guardar <nombre>   Guarda la sesión actual bajo un alias")
+    print("    codex-switch usar <nombre>      Cambia credenciales y reinicia el servidor activo")
+    print("    codex-switch nueva <nombre> [--device-auth] Inicia sesión con una cuenta adicional")
+    print("    codex-switch continuar          Continúa la última tarea con la cuenta activa")
+    print("    codex-switch id                 Muestra sólo el ID de la sesión más reciente\n")
+
+def cmd_guardar(nombre: str):
+    validate_alias(nombre)
+    if not nombre:
+        print("❌ Error: Especifica un nombre (ej: codex-switch guardar cuenta1)")
+        sys.exit(1)
+    auth_path = get_auth_path()
+    if not auth_path.is_file():
+        print("❌ Error: No existe un auth.json activo para guardar. Inicia sesión primero con 'codex login'.")
+        sys.exit(1)
+
+    cuentas_dir = get_cuentas_dir()
+    dest = cuentas_dir / f"{nombre}.json"
+    private_copy(auth_path, dest)
+    account_info = decode_account_from_auth(dest)
+    print(f"✅ Cuenta guardada con éxito:")
+    print(f"   Perfil : \033[1;36m{nombre}\033[0m")
+    print(f"   Cuenta : \033[1;32m{account_info}\033[0m")
+    print(f"   Destino: {dest}")
+
+def daemon_is_running() -> bool:
+    """Detecta el daemon de este CODEX_HOME, sin iniciar uno nuevo."""
+    pid_file = get_base_dir() / "app-server-daemon" / "daemon.pid"
+    try:
+        record = json.loads(pid_file.read_text(encoding="utf-8"))
+        pid = int(record["pid"])
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        # Evita confundir un PID reutilizado con el servidor de Codex.
+        proc = Path(f"/proc/{pid}")
+        if proc.exists():
+            args = (proc / "cmdline").read_bytes().split(b"\0")
+            if b"app-server" not in args or b"--managed-daemon" not in args:
+                return False
+            identity = record.get("processIdentity", {})
+            expected = identity.get("startTicks")
+            if expected is not None:
+                fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(fields[19]) != int(expected):
+                    return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+def write_auth_atomic(path: Path, content: bytes):
+    """Publica credenciales completas con permisos privados."""
+    fd, name = tempfile.mkstemp(prefix=".auth-switch-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+def run_daemon_action(action: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["codex", "app-server", "daemon", action], check=False,
+            timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode == 0:
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    print(f"❌ No se pudo ejecutar: codex app-server daemon {action}", flush=True)
+    return False
+
+def cmd_usar(nombre: str):
+    validate_alias(nombre)
+    if not nombre or nombre in (".", "..") or "/" in nombre or "\\" in nombre:
+        print("❌ Especifica un alias válido: codex-switch usar <nombre>")
+        sys.exit(1)
+    src = get_cuentas_dir() / f"{nombre}.json"
+    if not src.is_file():
+        print(f"❌ La cuenta '{nombre}' no existe. Usa: codex-switch listar")
+        sys.exit(1)
+    try:
+        selected = src.read_bytes()
+        data = json.loads(selected)
+        tokens = data.get("tokens") or {}
+        if not (data.get("OPENAI_API_KEY") or
+                (tokens.get("access_token") and tokens.get("refresh_token"))):
+            raise ValueError("credenciales incompletas")
+    except (OSError, ValueError, AttributeError, TypeError):
+        print("❌ El perfil no contiene credenciales válidas; no se cambió la cuenta.")
+        sys.exit(1)
+
+    auth_path = get_auth_path()
+    running = daemon_is_running()
+    if running:
+        # Detener primero impide que el servidor vuelva a guardar la cuenta anterior.
+        print("🔄 Deteniendo el servidor persistente para cambiar la cuenta...", flush=True)
+        print("   Las conexiones abiertas se desconectarán y deberán reconectarse.", flush=True)
+        if not run_daemon_action("stop"):
+            print("   No se reemplazaron las credenciales.")
+            sys.exit(1)
+        if daemon_is_running():
+            print("❌ El servidor sigue activo; no se reemplazaron las credenciales.")
+            sys.exit(1)
+    try:
+        write_auth_atomic(auth_path, selected)
+    except OSError:
+        print("❌ No se pudieron instalar las credenciales seleccionadas.")
+        if running:
+            run_daemon_action("start")
+        sys.exit(1)
+    if running and not run_daemon_action("start"):
+        print(f"   El perfil '{nombre}' quedó en disco, pero el servidor no se inició.")
+        print("   Para completar el cambio: codex app-server daemon start")
+        sys.exit(1)
+
+    account_info = decode_account_from_auth(auth_path)
+    print(f"✅ Cuenta seleccionada: {nombre} ({account_info})", flush=True)
+    if running:
+        print("   Servidor persistente reiniciado con las credenciales seleccionadas.")
+        print("   Reconecta la aplicación para continuar la conversación.")
+    print("   Si tienes una CLI independiente abierta, ciérrala y reanúdala:")
+    print("   codex-switch continuar")
+
+
+def cmd_nueva(nombre: str, device_auth: bool = False):
+    validate_alias(nombre)
+    if not nombre:
+        print("❌ Error: Especifica un nombre para la nueva cuenta (ej: codex-switch nueva cuenta2)")
+        sys.exit(1)
+    auth_path = get_auth_path()
+    cuentas_dir = get_cuentas_dir()
+
+    if auth_path.is_file():
+        actual = find_active_profile_name(cuentas_dir, auth_path)
+        if actual.startswith("(sin guardar"):
+            backup = cuentas_dir / "anterior_auto.json"
+            private_copy(auth_path, backup)
+            print(f"ℹ️ Credenciales actuales respaldadas preventivamente como 'anterior_auto'.")
+
+    temp_backup = get_base_dir() / "auth.json.bak"
+    if auth_path.is_file():
+        shutil.move(auth_path, temp_backup)
+
+    login_cmd = ["codex", "login"]
+    if device_auth:
+        login_cmd.append("--device-auth")
+    print("\n🚀 Iniciando flujo de login para la nueva cuenta de Codex...")
+    if device_auth:
+        print("   Se usará autenticación por dispositivo (--device-auth).")
+    try:
+        result = subprocess.run(login_cmd, check=False)
+        if result.returncode == 0 and auth_path.is_file():
+            dest = cuentas_dir / f"{nombre}.json"
+            private_copy(auth_path, dest)
+            account_info = decode_account_from_auth(dest)
+            print(f"\n✅ Nueva cuenta registrada y guardada como '\033[1;36m{nombre}\033[0m' ({account_info})!")
+            if temp_backup.is_file():
+                temp_backup.unlink()
+        else:
+            print("\n⚠️ El login no se completó correctamente. Restaurando credencial anterior...")
+            if temp_backup.is_file():
+                shutil.move(temp_backup, auth_path)
+            sys.exit(result.returncode or 1)
+    except FileNotFoundError:
+        print("\n❌ No se encontró el ejecutable 'codex'. Restaurando credencial anterior...")
+        if temp_backup.is_file():
+            shutil.move(temp_backup, auth_path)
+        sys.exit(127)
+
+def cmd_continuar(args: list[str]):
+    last_sid = get_most_recent_session_id()
+    cmd = ["codex", "resume"]
+    if args:
+        cmd.append(args[0])
+    elif last_sid:
+        cmd.append("--last")
+    else:
+        print("⚠️ No hay sesiones previas detectadas en session_index. Abriendo selector:")
+    
+    os.execvp(cmd[0], cmd)
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("status", "estado", "-s"):
+        cmd_status()
+    elif args[0] in ("listar", "list", "ls"):
+        cmd_status()
+    elif args[0] in ("guardar", "save"):
+        nombre = args[1] if len(args) > 1 else ""
+        cmd_guardar(nombre)
+    elif args[0] in ("usar", "use", "switch"):
+        nombre = args[1] if len(args) > 1 else ""
+        cmd_usar(nombre)
+    elif args[0] in ("nueva", "new", "login", "login-nueva"):
+        nombre = args[1] if len(args) > 1 else ""
+        options = args[2:]
+        unknown = [option for option in options if option != "--device-auth"]
+        if unknown:
+            print(f"Opción no reconocida para nueva cuenta: {unknown[0]}")
+            print("Uso: codex-switch nueva <nombre> [--device-auth]")
+            sys.exit(2)
+        cmd_nueva(nombre, device_auth="--device-auth" in options)
+    elif args[0] in ("continuar", "continue", "resume", "-c"):
+        cmd_continuar(args[1:])
+    elif args[0] in ("id", "hash"):
+        sid = get_most_recent_session_id()
+        if sid:
+            print(sid)
+        else:
+            sys.exit(1)
+    else:
+        print(f"Comando desconocido: {args[0]}")
+        print("Uso: codex-switch [status | guardar <nombre> | usar <nombre> | nueva <nombre> [--device-auth] | continuar | id]")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

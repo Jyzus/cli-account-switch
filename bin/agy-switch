@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""
+agy-switch: Gestor de multi-cuentas y reanudación de sesiones para Antigravity CLI (agy).
+Permite alternar entre perfiles locales de Antigravity y reanudar conversaciones.
+"""
+
+import sys
+import os
+import json
+import base64
+import shutil
+import re
+import subprocess
+from pathlib import Path
+
+def validate_alias(nombre: str):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", nombre):
+        print("❌ Alias inválido: usa de 1 a 64 letras, números, puntos, guiones o guiones bajos; empieza con letra o número.")
+        sys.exit(2)
+
+
+def private_copy(source: Path, destination: Path):
+    # Crear el destino con permisos privados antes de escribir credenciales.
+    import tempfile
+    fd, temporary = tempfile.mkstemp(prefix=".profile-", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(source.read_bytes())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def get_base_dir() -> Path:
+    home = Path(os.environ.get("HOME", Path.home()))
+    return home / ".gemini" / "antigravity-cli"
+
+def get_cuentas_dir() -> Path:
+    d = get_base_dir() / "cuentas"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    d.chmod(0o700)
+    return d
+
+def get_token_path() -> Path:
+    return get_base_dir() / "antigravity-oauth-token"
+
+def decode_email_from_token(token_file: Path) -> str:
+    if not token_file.is_file():
+        return "No configurada (sin token)"
+    try:
+        data = json.loads(token_file.read_text(encoding="utf-8"))
+        id_token = data.get("id_token", "")
+        if id_token and "." in id_token:
+            payload = id_token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            jwt = json.loads(base64.urlsafe_b64decode(payload))
+            return jwt.get("email") or jwt.get("sub") or "Sin email en JWT"
+        return "Token OAuth presente (sin id_token)"
+    except Exception as e:
+        return f"Error al decodificar: {e}"
+
+def get_most_recent_conversation_id() -> str:
+    brain_dir = get_base_dir() / "brain"
+    if not brain_dir.is_dir():
+        return ""
+    dirs = [d for d in brain_dir.iterdir() if d.is_dir() and len(d.name) > 10]
+    if not dirs:
+        return ""
+    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    return dirs[0].name
+
+def find_active_profile_name(cuentas_dir: Path, token_path: Path) -> str:
+    if not token_path.is_file():
+        return "(ninguna)"
+    try:
+        current_bytes = token_path.read_bytes()
+    except Exception:
+        return "(desconocido)"
+
+    for f in cuentas_dir.glob("*.token"):
+        try:
+            if f.read_bytes() == current_bytes:
+                return f.stem
+        except Exception:
+            continue
+    return "(sin guardar / temporal)"
+
+def cmd_status():
+    token_path = get_token_path()
+    cuentas_dir = get_cuentas_dir()
+    email = decode_email_from_token(token_path)
+    active_profile = find_active_profile_name(cuentas_dir, token_path)
+    last_cid = get_most_recent_conversation_id()
+
+    print("\n╭─────────────────────────────────────────────────────────────╮")
+    print("│  ✦ AGY Multi-Cuenta · Gestor de Sesiones & Tokens            │")
+    print("╰─────────────────────────────────────────────────────────────╯")
+    print(f"  • Cuenta activa  : \033[1;32m{email}\033[0m")
+    print(f"  • Perfil guardado: \033[1;36m{active_profile}\033[0m")
+    if last_cid:
+        print(f"  • Última sesión  : \033[1;33m{last_cid}\033[0m")
+        print(f"    (Para continuar: agy-switch continuar  o  agy -c)")
+    else:
+        print(f"  • Última sesión  : (sin conversaciones previas)")
+
+    guardadas = list(cuentas_dir.glob("*.token"))
+    print("\n  Cuentas disponibles:")
+    if not guardadas:
+        print("    (No hay cuentas guardadas todavía. Usa: agy-switch guardar <nombre>)")
+    else:
+        for f in sorted(guardadas):
+            p_name = f.stem
+            p_email = decode_email_from_token(f)
+            check = "★ [ACTIVA]" if p_name == active_profile else "  "
+            print(f"    {check} \033[1m{p_name:12}\033[0m → {p_email}")
+
+    print("\n  Comandos frecuentes:")
+    print("    agy-switch guardar <nombre>     Guarda la sesión actual bajo un alias")
+    print("    agy-switch usar <nombre>        Cambia de cuenta en 1 segundo")
+    print("    agy-switch nueva <nombre>       Inicia sesión con una cuenta adicional")
+    print("    agy-switch continuar            Continúa la última tarea con la cuenta activa")
+    print("    agy-switch id                   Muestra sólo el hash/ID de la conversación\n")
+
+def cmd_guardar(nombre: str):
+    validate_alias(nombre)
+    if not nombre:
+        print("❌ Error: Especifica un nombre (ej: agy-switch guardar cuenta1)")
+        sys.exit(1)
+    token_path = get_token_path()
+    if not token_path.is_file():
+        print("❌ Error: No existe un token activo para guardar. Inicia sesión primero con 'agy'.")
+        sys.exit(1)
+
+    cuentas_dir = get_cuentas_dir()
+    dest = cuentas_dir / f"{nombre}.token"
+    private_copy(token_path, dest)
+    email = decode_email_from_token(dest)
+    print(f"✅ Cuenta guardada con éxito:")
+    print(f"   Perfil : \033[1;36m{nombre}\033[0m")
+    print(f"   Email  : \033[1;32m{email}\033[0m")
+    print(f"   Destino: {dest}")
+
+def cmd_usar(nombre: str):
+    validate_alias(nombre)
+    if not nombre:
+        print("❌ Error: Especifica el nombre de la cuenta (ej: agy-switch usar cuenta2)")
+        sys.exit(1)
+    cuentas_dir = get_cuentas_dir()
+    src = cuentas_dir / f"{nombre}.token"
+    if not src.is_file():
+        print(f"❌ Error: La cuenta '{nombre}' no existe en {cuentas_dir}.")
+        print("   Usa 'agy-switch listar' para ver las cuentas disponibles.")
+        sys.exit(1)
+
+    token_path = get_token_path()
+    private_copy(src, token_path)
+    email = decode_email_from_token(token_path)
+    print(f"🔄 \033[1;32mCuenta cambiada con éxito!\033[0m")
+    print(f"   Ahora activa: \033[1;36m{nombre}\033[0m ({email})")
+    last_cid = get_most_recent_conversation_id()
+    if last_cid:
+        print(f"\n   Puedes reanudar tu tarea interrumpida con:")
+        print(f"   \033[1;33magy -c\033[0m   o   \033[1;33magy --conversation {last_cid}\033[0m\n")
+
+def cmd_nueva(nombre: str):
+    validate_alias(nombre)
+    if not nombre:
+        print("❌ Error: Especifica un nombre para la nueva cuenta (ej: agy-switch nueva cuenta2)")
+        sys.exit(1)
+    token_path = get_token_path()
+    cuentas_dir = get_cuentas_dir()
+
+    # Si hay token activo y no está guardado, guardarlo como backup
+    if token_path.is_file():
+        actual = find_active_profile_name(cuentas_dir, token_path)
+        if actual.startswith("(sin guardar"):
+            backup = cuentas_dir / "anterior_auto.token"
+            private_copy(token_path, backup)
+            print(f"ℹ️ Token actual respaldado preventivamente como 'anterior_auto'.")
+
+    # Mover temporalmente el token
+    temp_backup = get_base_dir() / "antigravity-oauth-token.bak"
+    if token_path.is_file():
+        shutil.move(token_path, temp_backup)
+
+    print("\n🚀 Preparando inicio de sesión para la nueva cuenta...")
+    print("   Se abrirá 'agy'. Completa el flujo de autenticación OAuth en tu navegador.")
+    print("   Una vez que agy cargue, sal con Ctrl+D o /exit.\n")
+    try:
+        subprocess.run(["agy"], check=False)
+    finally:
+        if token_path.is_file():
+            dest = cuentas_dir / f"{nombre}.token"
+            private_copy(token_path, dest)
+            email = decode_email_from_token(dest)
+            print(f"\n✅ Nueva cuenta registrada y guardada como '\033[1;36m{nombre}\033[0m' ({email})!")
+            if temp_backup.is_file():
+                temp_backup.unlink()
+        else:
+            print("\n⚠️ No se detectó inicio de sesión completado. Restaurando credencial anterior...")
+            if temp_backup.is_file():
+                shutil.move(temp_backup, token_path)
+
+def cmd_continuar(args: list[str]):
+    last_cid = get_most_recent_conversation_id()
+    cmd = ["agy"]
+    if args:
+        cmd.extend(["--conversation", args[0]])
+    elif last_cid:
+        cmd.append("-c")
+    else:
+        print("⚠️ No hay conversaciones recientes para continuar. Iniciando sesión limpia.")
+    
+    # Reemplazar el proceso actual por agy
+    os.execvp(cmd[0], cmd)
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("status", "estado", "-s"):
+        cmd_status()
+    elif args[0] in ("listar", "list", "ls"):
+        cmd_status()
+    elif args[0] in ("guardar", "save"):
+        nombre = args[1] if len(args) > 1 else ""
+        cmd_guardar(nombre)
+    elif args[0] in ("usar", "use", "switch"):
+        nombre = args[1] if len(args) > 1 else ""
+        cmd_usar(nombre)
+    elif args[0] in ("nueva", "new", "login", "login-nueva"):
+        nombre = args[1] if len(args) > 1 else ""
+        cmd_nueva(nombre)
+    elif args[0] in ("continuar", "continue", "resume", "-c"):
+        cmd_continuar(args[1:])
+    elif args[0] in ("id", "hash"):
+        cid = get_most_recent_conversation_id()
+        if cid:
+            print(cid)
+        else:
+            sys.exit(1)
+    else:
+        print(f"Comando desconocido: {args[0]}")
+        print("Uso: agy-switch [status | guardar <nombre> | usar <nombre> | nueva <nombre> | continuar | id]")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
