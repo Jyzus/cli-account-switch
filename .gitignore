@@ -6,3 +6,4 @@ cuentas/
 auth.json
 *.token
 *.bak
+.planifier/

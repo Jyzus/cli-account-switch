@@ -1,0 +1,24 @@
+{
+  "nombre": "Switch",
+  "modo": "feature",
+  "repos": [
+    {
+      "nombre": "cli-account-switch",
+      "ruta": ".",
+      "componente": "CA-001"
+    }
+  ],
+  "backend": "docs",
+  "trabajadores": [
+    {
+      "id": "22bf18da-4f45-450b-a00e-8360c56f9af2",
+      "cli": "agy",
+      "model": "gemini-3.0-pro",
+      "predeterminado": true
+    }
+  ],
+  "docs": {
+    "collection_id": "59ee1556-da07-4160-890b-fab58d4329d1",
+    "slug": "switch"
+  }
+}
