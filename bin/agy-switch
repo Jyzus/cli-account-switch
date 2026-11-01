@@ -664,11 +664,42 @@ def cmd_continuar(args: list[str]):
     # Reemplazar el proceso actual por agy
     os.execvp(cmd[0], cmd)
 
+def find_widget_executable() -> Path | None:
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "switch-widget",
+        Path.home() / ".local" / "bin" / "switch-widget",
+        Path("/usr/local/bin/switch-widget"),
+    ]
+    which = shutil.which("switch-widget")
+    if which:
+        candidates.insert(0, Path(which))
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def cmd_widget(extra_args: list):
+    w = find_widget_executable()
+    if not w:
+        print("❌ Error: No se encontró el ejecutable 'switch-widget'.")
+        print("   Ejecuta ./install.sh para instalarlo en tu sistema.")
+        sys.exit(1)
+    cmd = [sys.executable, str(w), "--filter", "agy"] + extra_args
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        pass
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
         target = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         cmd_status(target)
+    elif args[0] in ("widget", "gui", "ui", "dashboard"):
+        cmd_widget(args[1:])
     elif args[0] in ("listar", "list", "ls"):
         cmd_listar()
     elif args[0] in ("guardar", "save"):
@@ -699,6 +730,7 @@ def main():
     elif args[0] in ("ayuda", "help", "--help", "-h"):
         print("Uso: agy-switch [comando] [argumentos]")
         print("\nComandos disponibles:")
+        print("  widget            Abre el widget gráfico multiplataforma de escritorio (alias: gui, ui)")
         print("  status [nombre]   Consulta en vivo tokens, cuotas y límites restantes (alias: tokens, cuota)")
         print("  listar            Lista rápida de cuentas en disco sin consultar red (offline)")
         print("  guardar <nombre>  Guarda las credenciales activas bajo un alias")
@@ -708,7 +740,7 @@ def main():
         print("  id                Muestra el identificador de la última conversación")
     else:
         print(f"Comando desconocido: {args[0]}")
-        print("Uso: agy-switch [status [nombre] | tokens | listar | guardar <nombre> | usar <nombre> | nueva <nombre> | continuar | id]")
+        print("Uso: agy-switch [widget | status [nombre] | tokens | listar | guardar <nombre> | usar <nombre> | nueva <nombre> | continuar | id]")
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -704,6 +704,35 @@ def cmd_continuar(args: list[str]):
     
     os.execvp(cmd[0], cmd)
 
+def find_widget_executable() -> Path | None:
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "switch-widget",
+        Path.home() / ".local" / "bin" / "switch-widget",
+        Path("/usr/local/bin/switch-widget"),
+    ]
+    which = shutil.which("switch-widget")
+    if which:
+        candidates.insert(0, Path(which))
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def cmd_widget(extra_args: list):
+    w = find_widget_executable()
+    if not w:
+        print("❌ Error: No se encontró el ejecutable 'switch-widget'.")
+        print("   Ejecuta ./install.sh para instalarlo en tu sistema.")
+        sys.exit(1)
+    cmd = [sys.executable, str(w), "--filter", "codex"] + extra_args
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        pass
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
@@ -731,6 +760,8 @@ def main():
         cmd_nueva(nombre, device_auth=device_auth, force=force)
     elif args[0] in ("continuar", "continue", "resume", "-c"):
         cmd_continuar(args[1:])
+    elif args[0] in ("widget", "gui", "ui", "dashboard"):
+        cmd_widget(args[1:])
     elif args[0] in ("id", "hash"):
         sid = get_most_recent_session_id()
         if sid:
@@ -740,6 +771,7 @@ def main():
     elif args[0] in ("ayuda", "help", "--help", "-h"):
         print("Uso: codex-switch [comando] [argumentos]")
         print("\nComandos disponibles:")
+        print("  widget            Abre el widget gráfico multiplataforma de escritorio (alias: gui, ui)")
         print("  status [nombre]   Consulta en vivo tokens, cuotas y límites restantes (alias: tokens, cuota)")
         print("  listar            Lista rápida de cuentas en disco sin consultar red (offline)")
         print("  guardar <nombre>  Guarda las credenciales activas bajo un alias")
@@ -749,7 +781,7 @@ def main():
         print("  id                Muestra el identificador de la última sesión")
     else:
         print(f"Comando desconocido: {args[0]}")
-        print("Uso: codex-switch [status [nombre] | tokens | listar | guardar <nombre> | usar <nombre> | nueva <nombre> | continuar | id]")
+        print("Uso: codex-switch [widget | status [nombre] | tokens | listar | guardar <nombre> | usar <nombre> | nueva <nombre> | continuar | id]")
         sys.exit(1)
 
 if __name__ == "__main__":

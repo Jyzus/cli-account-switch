@@ -1,0 +1,2108 @@
+#!/usr/bin/env python3
+"""
+CLI Account Switch · Desktop Widget
+Monitor multiplataforma de cuotas, tokens en vivo, tiempo de reinicio y consumo semanal.
+Compatible con Linux, macOS y Windows.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+# ==============================================================================
+# CARGA DE MÓDULOS DE CODEX Y AGY
+# ==============================================================================
+
+def find_module_file(name: str) -> Path | None:
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / name,
+        Path.home() / ".local" / "bin" / name,
+        Path("/usr/local/bin") / name,
+    ]
+    which = shutil.which(name)
+    if which:
+        candidates.insert(0, Path(which))
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+def load_cli_module(name: str):
+    f = find_module_file(name)
+    if not f:
+        return None
+    try:
+        mod_name = name.replace("-", "_")
+        return SourceFileLoader(mod_name, str(f)).load_module()
+    except Exception as e:
+        print(f"Advertencia: no se pudo cargar {name} ({f}): {e}", file=sys.stderr)
+        return None
+
+CODEX_MOD = load_cli_module("codex-switch")
+AGY_MOD = load_cli_module("agy-switch")
+
+# ==============================================================================
+# PROVEEDORES DE CUENTAS (EXTENSIBLES)
+# ==============================================================================
+
+class BaseProvider:
+    id: str = ""
+    name: str = ""
+    badge: str = ""
+    cli_cmd: str = ""
+    color: str = "#6366f1"
+
+    def is_available(self) -> bool:
+        raise NotImplementedError
+
+    def get_status(self) -> dict:
+        raise NotImplementedError
+
+    def switch_account(self, name: str, force: bool = False) -> tuple[bool, str, list]:
+        raise NotImplementedError
+
+    def get_running_clients(self) -> list:
+        return []
+
+
+class CodexProvider(BaseProvider):
+    id = "codex"
+    name = "OpenAI Codex"
+    badge = "CODEX"
+    cli_cmd = "codex-switch"
+    color = "#10b981"
+
+    def is_available(self) -> bool:
+        return CODEX_MOD is not None
+
+    def get_running_clients(self) -> list:
+        if CODEX_MOD and hasattr(CODEX_MOD, "find_running_clients"):
+            try:
+                return CODEX_MOD.find_running_clients("codex")
+            except Exception:
+                pass
+        return []
+
+    def get_status(self) -> dict:
+        if not CODEX_MOD:
+            return {
+                "id": self.id,
+                "name": self.name,
+                "badge": self.badge,
+                "color": self.color,
+                "error": "Módulo codex-switch no encontrado",
+                "accounts": [],
+            }
+
+        auth_path = CODEX_MOD.get_auth_path()
+        cuentas_dir = CODEX_MOD.get_cuentas_dir()
+        active_profile = CODEX_MOD.find_active_profile_name(cuentas_dir, auth_path)
+        active_email = CODEX_MOD.decode_account_from_auth(auth_path)
+
+        guardadas = sorted(cuentas_dir.glob("*.json"))
+        now_ts = int(time.time())
+
+        def check_profile(p: Path) -> dict:
+            p_name = p.stem
+            is_active = (p_name == active_profile)
+            q = CODEX_MOD.fetch_codex_quota(p, active_profile=active_profile)
+            err = q.get("err_msg")
+
+            acc = {
+                "name": p_name,
+                "provider": self.id,
+                "provider_name": self.name,
+                "email": q.get("email") or CODEX_MOD.decode_account_from_auth(p),
+                "plan": (q.get("plan_type") or "desconocido").upper(),
+                "is_active": is_active,
+                "error": err,
+                "status": "error" if err else "available",
+                "status_text": "Disponible" if not err else err,
+                "primary_window": None,
+                "weekly_window": None,
+                "reset_credits": q.get("rate_limit_reset_credits", {}).get("available_count", 0),
+            }
+
+            if not err and q.get("rate_limit"):
+                rate = q["rate_limit"]
+                allowed = rate.get("allowed", True)
+                if not allowed:
+                    acc["status"] = "exhausted"
+                    acc["status_text"] = "Agotado"
+
+                pw = rate.get("primary_window")
+                if pw:
+                    used = int(pw.get("used_percent", 0))
+                    rem = max(0, 100 - used)
+                    res_sec = int(pw.get("reset_after_seconds", 0))
+                    win_sec = int(pw.get("limit_window_seconds", 18000))
+                    label = "5 Horas" if win_sec <= 21600 else f"{win_sec // 86400} Días"
+                    acc["primary_window"] = {
+                        "label": label,
+                        "used_percent": used,
+                        "remaining_percent": rem,
+                        "reset_after_seconds": res_sec,
+                        "reset_at_timestamp": now_ts + res_sec if res_sec > 0 else now_ts,
+                        "window_seconds": win_sec,
+                    }
+
+                sw = rate.get("secondary_window")
+                if sw:
+                    s_used = int(sw.get("used_percent", 0))
+                    s_rem = max(0, 100 - s_used)
+                    s_res = int(sw.get("reset_after_seconds", 0))
+                    s_win = int(sw.get("limit_window_seconds", 604800))
+                    acc["weekly_window"] = {
+                        "label": "Consumo Semanal (7d)",
+                        "used_percent": s_used,
+                        "remaining_percent": s_rem,
+                        "reset_after_seconds": s_res,
+                        "reset_at_timestamp": now_ts + s_res if s_res > 0 else now_ts,
+                        "window_seconds": s_win,
+                    }
+                elif pw and pw.get("limit_window_seconds", 0) >= 86400 * 5:
+                    acc["weekly_window"] = acc["primary_window"]
+
+            return acc
+
+        with ThreadPoolExecutor(max_workers=min(len(guardadas), 8) or 1) as pool:
+            accounts = list(pool.map(check_profile, guardadas))
+
+        return {
+            "id": self.id,
+            "name": self.name,
+            "badge": self.badge,
+            "cli_cmd": self.cli_cmd,
+            "color": self.color,
+            "active_profile": active_profile,
+            "active_email": active_email,
+            "accounts": accounts,
+        }
+
+    def switch_account(self, name: str, force: bool = False) -> tuple[bool, str, list]:
+        mod_file = find_module_file("codex-switch")
+        if not mod_file:
+            return False, "Ejecutable codex-switch no encontrado", []
+        cmd = [sys.executable, str(mod_file), "usar", name]
+        if force:
+            cmd.append("--force")
+
+        running = self.get_running_clients()
+        if running and not force:
+            return False, f"Se detectaron {len(running)} sesiones activas de Codex", running
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Cuenta cambiada con éxito a '{name}'", []
+        return False, res.stderr.strip() or res.stdout.strip() or "Error al cambiar cuenta", running
+
+
+class AgyProvider(BaseProvider):
+    id = "agy"
+    name = "Google Antigravity"
+    badge = "AGY"
+    cli_cmd = "agy-switch"
+    color = "#6366f1"
+
+    def is_available(self) -> bool:
+        return AGY_MOD is not None
+
+    def get_running_clients(self) -> list:
+        if AGY_MOD and hasattr(AGY_MOD, "find_running_clients"):
+            try:
+                return AGY_MOD.find_running_clients("agy")
+            except Exception:
+                pass
+        return []
+
+    def get_status(self) -> dict:
+        if not AGY_MOD:
+            return {
+                "id": self.id,
+                "name": self.name,
+                "badge": self.badge,
+                "color": self.color,
+                "error": "Módulo agy-switch no encontrado",
+                "accounts": [],
+            }
+
+        token_path = AGY_MOD.get_token_path()
+        cuentas_dir = AGY_MOD.get_cuentas_dir()
+        active_profile = AGY_MOD.find_active_profile_name(cuentas_dir, token_path)
+        active_email = AGY_MOD.decode_email_from_token(token_path)
+
+        guardadas = sorted(cuentas_dir.glob("*.token"))
+        now_dt = datetime.now(timezone.utc)
+        now_ts = int(now_dt.timestamp())
+
+        def check_profile(p: Path) -> dict:
+            p_name = p.stem
+            is_active = (p_name == active_profile)
+            q = AGY_MOD.fetch_agy_quota(p, active_profile=active_profile)
+            err = q.get("err_msg")
+
+            acc = {
+                "name": p_name,
+                "provider": self.id,
+                "provider_name": self.name,
+                "email": q.get("email") or AGY_MOD.decode_email_from_token(p),
+                "plan": (q.get("plan") or "Antigravity").upper(),
+                "is_active": is_active,
+                "error": err,
+                "status": "error" if err else "available",
+                "status_text": "Disponible" if not err else err,
+                "gemini": None,
+                "claude": None,
+                "weekly_window": None,
+            }
+
+            if not err:
+                models = q.get("models", {})
+
+                # Gemini
+                g_model = (
+                    models.get("gemini-2.5-flash")
+                    or models.get("gemini-2.5-pro")
+                    or models.get("gemini-3.5-flash-lite")
+                    or {}
+                )
+                g_q = g_model.get("quotaInfo", {})
+                g_frac = float(g_q.get("remainingFraction", 1.0))
+                g_res_str = g_q.get("resetTime", "")
+                g_sec = 0
+                g_res_ts = now_ts
+                if g_res_str:
+                    try:
+                        dt = datetime.fromisoformat(g_res_str.replace("Z", "+00:00"))
+                        g_sec = max(0, int((dt - now_dt).total_seconds()))
+                        g_res_ts = int(dt.timestamp())
+                    except Exception:
+                        pass
+
+                g_rem = int(round(g_frac * 100))
+                acc["gemini"] = {
+                    "label": "Gemini (5h)",
+                    "remaining_percent": g_rem,
+                    "used_percent": max(0, 100 - g_rem),
+                    "reset_after_seconds": g_sec,
+                    "reset_at_timestamp": g_res_ts,
+                }
+
+                # Claude
+                c_model = (
+                    models.get("claude-sonnet-5-5-high")
+                    or models.get("claude-opus-5-5-medium")
+                    or models.get("claude-opus-4-6-thinking")
+                    or {}
+                )
+                c_q = c_model.get("quotaInfo", {})
+                c_frac = float(c_q.get("remainingFraction", 1.0))
+                c_res_str = c_q.get("resetTime", "")
+                c_sec = 0
+                c_res_ts = now_ts
+                if c_res_str:
+                    try:
+                        dt = datetime.fromisoformat(c_res_str.replace("Z", "+00:00"))
+                        c_sec = max(0, int((dt - now_dt).total_seconds()))
+                        c_res_ts = int(dt.timestamp())
+                    except Exception:
+                        pass
+
+                c_rem = int(round(c_frac * 100))
+                acc["claude"] = {
+                    "label": "Claude 3P (5h)",
+                    "remaining_percent": c_rem,
+                    "used_percent": max(0, 100 - c_rem),
+                    "reset_after_seconds": c_sec,
+                    "reset_at_timestamp": c_res_ts,
+                }
+
+                if g_frac <= 0.05 and c_frac <= 0.05:
+                    acc["status"] = "exhausted"
+                    acc["status_text"] = "Agotado"
+
+            return acc
+
+        with ThreadPoolExecutor(max_workers=min(len(guardadas), 8) or 1) as pool:
+            accounts = list(pool.map(check_profile, guardadas))
+
+        return {
+            "id": self.id,
+            "name": self.name,
+            "badge": self.badge,
+            "cli_cmd": self.cli_cmd,
+            "color": self.color,
+            "active_profile": active_profile,
+            "active_email": active_email,
+            "accounts": accounts,
+        }
+
+    def switch_account(self, name: str, force: bool = False) -> tuple[bool, str, list]:
+        mod_file = find_module_file("agy-switch")
+        if not mod_file:
+            return False, "Ejecutable agy-switch no encontrado", []
+        cmd = [sys.executable, str(mod_file), "usar", name]
+        if force:
+            cmd.append("--force")
+
+        running = self.get_running_clients()
+        if running and not force:
+            return False, f"Se detectaron {len(running)} sesiones activas de AGY", running
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Cuenta cambiada con éxito a '{name}'", []
+        return False, res.stderr.strip() or res.stdout.strip() or "Error al cambiar cuenta", running
+
+
+# Registro de proveedores (fácilmente extensible para futuros modelos)
+PROVIDERS: dict[str, BaseProvider] = {
+    "codex": CodexProvider(),
+    "agy": AgyProvider(),
+}
+
+# ==============================================================================
+# FRONTEND HTML5 / CSS3 / JAVASCRIPT ULTRA-MODERNO (EMBEBIDO)
+# ==============================================================================
+
+HTML_DASHBOARD = """<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <meta name="theme-color" content="#0b0f19">
+  <title>CLI Account Switch · Widget</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --surface: rgba(18, 24, 38, 0.82);
+      --surface-hover: rgba(26, 34, 52, 0.92);
+      --surface-active: rgba(32, 42, 64, 0.95);
+      --border: rgba(255, 255, 255, 0.08);
+      --border-accent: rgba(99, 102, 241, 0.4);
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-subtle: #64748b;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --codex: #10b981;
+      --agy: #8b5cf6;
+      --green: #10b981;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 14px;
+      --radius-xl: 18px;
+      --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.25);
+      --shadow-md: 0 8px 24px -4px rgba(0, 0, 0, 0.4);
+      --shadow-lg: 0 16px 36px -8px rgba(0, 0, 0, 0.6);
+      --glass-blur: blur(16px);
+      --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      background-image:
+        radial-gradient(circle at 15% 10%, rgba(99, 102, 241, 0.12) 0%, transparent 45%),
+        radial-gradient(circle at 85% 90%, rgba(16, 185, 129, 0.09) 0%, transparent 45%);
+      background-attachment: fixed;
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      line-height: 1.45;
+      font-size: 14px;
+    }
+
+    /* Contenedor Principal */
+    .app-container {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 20px 16px 40px;
+      width: 100%;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Header Superior */
+    header {
+      background: var(--surface);
+      backdrop-filter: var(--glass-blur);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xl);
+      padding: 14px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: var(--shadow-sm);
+      position: sticky;
+      top: 14px;
+      z-index: 50;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: var(--radius-md);
+      background: linear-gradient(135deg, #6366f1, #10b981);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
+      color: #fff;
+    }
+
+    .brand-title {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .brand-badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      background: rgba(99, 102, 241, 0.18);
+      color: #a5b4fc;
+      border: 1px solid rgba(99, 102, 241, 0.3);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .auto-refresh-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 4px 10px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .refresh-countdown {
+      font-weight: 700;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      min-width: 36px;
+    }
+
+    select.interval-select {
+      background: transparent;
+      border: none;
+      color: var(--text);
+      font-size: 12px;
+      cursor: pointer;
+      outline: none;
+      padding-right: 2px;
+    }
+
+    select.interval-select option {
+      background: #182234;
+      color: #fff;
+    }
+
+    .btn-refresh {
+      background: linear-gradient(135deg, #4f46e5, #6366f1);
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: var(--radius-md);
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: var(--transition);
+      box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
+    }
+
+    .btn-refresh:hover {
+      filter: brightness(1.15);
+      transform: translateY(-1px);
+    }
+
+    .btn-refresh:active {
+      transform: translateY(1px);
+    }
+
+    .btn-refresh svg.spinning {
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    /* Barra de Métricas y Controles */
+    .controls-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .filter-tabs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface);
+      backdrop-filter: var(--glass-blur);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 4px;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: var(--radius-md);
+      cursor: pointer;
+      transition: var(--transition);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .tab-btn:hover {
+      color: var(--text);
+    }
+
+    .tab-btn.active {
+      background: rgba(255, 255, 255, 0.1);
+      color: #ffffff;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    }
+
+    .tab-count {
+      font-size: 11px;
+      background: rgba(255, 255, 255, 0.12);
+      padding: 1px 6px;
+      border-radius: 9999px;
+    }
+
+    .search-box {
+      position: relative;
+      flex: 1;
+      max-width: 320px;
+      min-width: 200px;
+    }
+
+    .search-box input {
+      width: 100%;
+      background: var(--surface);
+      backdrop-filter: var(--glass-blur);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 8px 14px 8px 36px;
+      color: var(--text);
+      font-size: 13px;
+      outline: none;
+      transition: var(--transition);
+    }
+
+    .search-box input:focus {
+      border-color: var(--border-accent);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+    }
+
+    .search-box svg {
+      position: absolute;
+      left: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-subtle);
+      pointer-events: none;
+    }
+
+    /* Resumen rápido de cuentas */
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+    }
+
+    .metric-card {
+      background: var(--surface);
+      backdrop-filter: var(--glass-blur);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .metric-icon {
+      width: 38px;
+      height: 38px;
+      border-radius: var(--radius-md);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      flex-shrink: 0;
+    }
+
+    .metric-info {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .metric-val {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.2;
+    }
+
+    .metric-label {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* Grid de Cuentas */
+    .accounts-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+      gap: 14px;
+    }
+
+    .account-card {
+      background: var(--surface);
+      backdrop-filter: var(--glass-blur);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xl);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-shadow: var(--shadow-sm);
+      transition: var(--transition);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .account-card:hover {
+      background: var(--surface-hover);
+      border-color: rgba(255, 255, 255, 0.16);
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-md);
+    }
+
+    .account-card.is-active {
+      border-color: rgba(99, 102, 241, 0.5);
+      box-shadow: 0 4px 20px -2px rgba(99, 102, 241, 0.2);
+    }
+
+    .active-indicator {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: linear-gradient(90deg, #6366f1, #10b981);
+    }
+
+    /* Cabecera de la Tarjeta */
+    .card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .card-title-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .card-tags {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .provider-pill {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: var(--radius-sm);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .provider-codex {
+      background: rgba(16, 185, 129, 0.18);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.35);
+    }
+
+    .provider-agy {
+      background: rgba(139, 92, 246, 0.18);
+      color: #c084fc;
+      border: 1px solid rgba(139, 92, 246, 0.35);
+    }
+
+    .active-badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: var(--radius-sm);
+      background: rgba(245, 158, 11, 0.2);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .account-name {
+      font-size: 16px;
+      font-weight: 700;
+      color: #ffffff;
+      letter-spacing: -0.01em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .status-badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 9px;
+      border-radius: 9999px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .status-badge.available {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .status-badge.exhausted {
+      background: rgba(239, 68, 68, 0.15);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+
+    .status-badge.error {
+      background: rgba(245, 158, 11, 0.15);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+
+    .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    /* Email & Plan */
+    .card-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: rgba(0, 0, 0, 0.22);
+      border-radius: var(--radius-md);
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+
+    .email-display {
+      color: var(--text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .plan-pill {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: var(--radius-sm);
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      text-transform: uppercase;
+      flex-shrink: 0;
+    }
+
+    /* Sección de Cuotas y Barras */
+    .quotas-section {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .quota-item {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .quota-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+    }
+
+    .quota-title {
+      font-weight: 600;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .quota-fraction {
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .progress-bar-bg {
+      height: 7px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 9999px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      border-radius: 9999px;
+      transition: width 0.5s ease-out;
+    }
+
+    .bar-high {
+      background: linear-gradient(90deg, #059669, #10b981);
+    }
+
+    .bar-medium {
+      background: linear-gradient(90deg, #d97706, #f59e0b);
+    }
+
+    .bar-low {
+      background: linear-gradient(90deg, #dc2626, #ef4444);
+    }
+
+    .quota-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      color: var(--text-subtle);
+    }
+
+    .reset-clock {
+      color: #cbd5e1;
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .reset-clock.ready {
+      color: #34d399;
+      font-weight: 600;
+    }
+
+    .reset-credits-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: #fde047;
+      background: rgba(250, 204, 21, 0.1);
+      border: 1px solid rgba(250, 204, 21, 0.25);
+      border-radius: var(--radius-sm);
+      padding: 4px 8px;
+      font-weight: 600;
+    }
+
+    /* Mensajes de error */
+    .card-error {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      border-radius: var(--radius-md);
+      padding: 8px 10px;
+      font-size: 12px;
+      color: #fca5a5;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Botones de acción inferiores */
+    .card-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: auto;
+      padding-top: 4px;
+    }
+
+    .btn-switch {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: var(--transition);
+    }
+
+    .btn-switch:hover:not(:disabled) {
+      background: linear-gradient(135deg, #4f46e5, #6366f1);
+      border-color: rgba(255, 255, 255, 0.2);
+      color: #ffffff;
+      transform: translateY(-1px);
+    }
+
+    .btn-switch:disabled {
+      opacity: 0.55;
+      cursor: default;
+      background: rgba(16, 185, 129, 0.12);
+      border-color: rgba(16, 185, 129, 0.3);
+      color: #34d399;
+    }
+
+    .btn-icon {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: var(--radius-md);
+      width: 34px;
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: var(--transition);
+      flex-shrink: 0;
+    }
+
+    .btn-icon:hover {
+      background: rgba(255, 255, 255, 0.12);
+      color: #ffffff;
+    }
+
+    /* Estado Vacío */
+    .empty-state {
+      grid-column: 1 / -1;
+      text-align: center;
+      padding: 60px 20px;
+      background: var(--surface);
+      border: 1px dashed var(--border);
+      border-radius: var(--radius-xl);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .empty-state h3 {
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .empty-state p {
+      color: var(--text-muted);
+      font-size: 13px;
+      max-width: 440px;
+    }
+
+    .code-pill {
+      font-family: monospace;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 3px 8px;
+      border-radius: 4px;
+      color: #a5b4fc;
+    }
+
+    /* Modal de Advertencia de Sesión Activa */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      padding: 16px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease-out;
+    }
+
+    .modal-overlay.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .modal-card {
+      background: #141b2a;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: var(--radius-xl);
+      max-width: 460px;
+      width: 100%;
+      padding: 24px;
+      box-shadow: var(--shadow-lg);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      transform: scale(0.96);
+      transition: transform 0.2s ease-out;
+    }
+
+    .modal-overlay.open .modal-card {
+      transform: scale(1);
+    }
+
+    .modal-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .modal-icon-warn {
+      width: 40px;
+      height: 40px;
+      border-radius: var(--radius-md);
+      background: rgba(245, 158, 11, 0.18);
+      color: #fbbf24;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      flex-shrink: 0;
+    }
+
+    .modal-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    .modal-body {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.5;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .clients-list {
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 8px 12px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #cbd5e1;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+
+    .modal-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 6px;
+    }
+
+    .btn-cancel {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 16px;
+      border-radius: var(--radius-md);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .btn-force {
+      background: linear-gradient(135deg, #dc2626, #ef4444);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      color: #ffffff;
+      padding: 8px 16px;
+      border-radius: var(--radius-md);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(239, 68, 68, 0.35);
+    }
+
+    /* Toast Notifications */
+    .toast-container {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 200;
+      pointer-events: none;
+    }
+
+    .toast {
+      background: #182234;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: var(--radius-md);
+      padding: 10px 16px;
+      font-size: 13px;
+      font-weight: 500;
+      color: #ffffff;
+      box-shadow: var(--shadow-md);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      pointer-events: auto;
+      transform: translateY(20px);
+      opacity: 0;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .toast.show {
+      transform: translateY(0);
+      opacity: 1;
+    }
+
+    .toast.success {
+      border-left: 4px solid #10b981;
+    }
+
+    .toast.error {
+      border-left: 4px solid #ef4444;
+    }
+
+    .toast.info {
+      border-left: 4px solid #6366f1;
+    }
+
+    /* Footer */
+    footer {
+      text-align: center;
+      padding: 20px 10px;
+      color: var(--text-subtle);
+      font-size: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    /* Responsive */
+    @media (max-width: 640px) {
+      .app-container {
+        padding: 12px 10px 30px;
+      }
+      header {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 12px;
+      }
+      .header-actions {
+        justify-content: space-between;
+      }
+      .accounts-grid {
+        grid-template-columns: 1fr;
+      }
+      .controls-bar {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .search-box {
+        max-width: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header>
+      <div class="brand">
+        <div class="brand-icon">✦</div>
+        <div class="brand-title">
+          CLI Switch Widget
+          <span class="brand-badge">Multiplataforma</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <div class="auto-refresh-pill" title="Intervalo de actualización automática">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <polyline points="12 6 12 12 16 14"></polyline>
+          </svg>
+          <span class="refresh-countdown" id="countdown-display">--:--</span>
+          <select id="interval-select" class="interval-select">
+            <option value="60">1 min</option>
+            <option value="180">3 min</option>
+            <option value="300" selected>5 min</option>
+            <option value="600">10 min</option>
+            <option value="900">15 min</option>
+            <option value="0">Pausar</option>
+          </select>
+        </div>
+        <button id="btn-manual-refresh" class="btn-refresh" title="Actualizar datos ahora">
+          <svg id="refresh-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
+          </svg>
+          <span>Actualizar</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Resumen rápido de métricas -->
+    <div class="summary-strip">
+      <div class="metric-card">
+        <div class="metric-icon" style="background: rgba(99, 102, 241, 0.18); color: #818cf8;">👥</div>
+        <div class="metric-info">
+          <span class="metric-val" id="metric-total">0</span>
+          <span class="metric-label">Cuentas Monitoreadas</span>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon" style="background: rgba(16, 185, 129, 0.18); color: #34d399;">🟢</div>
+        <div class="metric-info">
+          <span class="metric-val" id="metric-ready">0</span>
+          <span class="metric-label">Listas con Tokens</span>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon" style="background: rgba(245, 158, 11, 0.18); color: #fbbf24;">⚡</div>
+        <div class="metric-info">
+          <span class="metric-val" id="metric-active">0</span>
+          <span class="metric-label">Activas en Disco</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Barra de Filtros y Búsqueda -->
+    <div class="controls-bar">
+      <div class="filter-tabs">
+        <button class="tab-btn active" data-filter="all">
+          Todos <span class="tab-count" id="count-all">0</span>
+        </button>
+        <button class="tab-btn" data-filter="codex">
+          OpenAI Codex <span class="tab-count" id="count-codex">0</span>
+        </button>
+        <button class="tab-btn" data-filter="agy">
+          Google AGY <span class="tab-count" id="count-agy">0</span>
+        </button>
+      </div>
+
+      <div class="search-box">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <input type="text" id="search-input" placeholder="Buscar por alias o correo..." />
+      </div>
+    </div>
+
+    <!-- Grid de Tarjetas de Cuenta -->
+    <div class="accounts-grid" id="accounts-container">
+      <div class="empty-state">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color: var(--text-subtle);">
+          <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"></path>
+        </svg>
+        <h3>Cargando estado de cuentas...</h3>
+        <p>Consultando cuotas en vivo e información de reinicio.</p>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer>
+      <div>Sincronizado con CLI Account Switch · Servidor local 127.0.0.1</div>
+      <div>Compatible con <span class="code-pill">codex-switch</span> y <span class="code-pill">agy-switch</span></div>
+    </footer>
+  </div>
+
+  <!-- Modal de Advertencia de Sesión Activa -->
+  <div class="modal-overlay" id="safety-modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-icon-warn">⚠️</div>
+        <div>
+          <div class="modal-title">Sesiones activas detectadas</div>
+          <div style="font-size: 12px; color: var(--text-subtle);">Protección contra rotura de tokens</div>
+        </div>
+      </div>
+      <div class="modal-body">
+        <p>
+          Se detectaron clientes activos en ejecución. Si cambias de cuenta ahora,
+          las sesiones abiertas se desconectarán y los tokens activos podrían invalidarse:
+        </p>
+        <div class="clients-list" id="modal-clients-list"></div>
+        <p style="font-size: 12px; color: #fca5a5;">
+          ¿Deseas cancelar el cambio para cerrar tus sesiones manualmente o forzar el cambio inmediato?
+        </p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-cancel" id="btn-modal-cancel">Cancelar</button>
+        <button class="btn-force" id="btn-modal-force">Forzar Cambio</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Contenedor de Toasts -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script>
+    // Estado de la Aplicación
+    let appData = { providers: [], timestamp: Date.now() / 1000 };
+    let currentFilter = "all";
+    let searchQuery = "";
+    let autoRefreshInterval = 300; // 5 minutos por defecto
+    let secondsUntilRefresh = 300;
+    let pendingSwitch = null;
+
+    // Elementos DOM
+    const accountsContainer = document.getElementById("accounts-container");
+    const countdownDisplay = document.getElementById("countdown-display");
+    const intervalSelect = document.getElementById("interval-select");
+    const btnManualRefresh = document.getElementById("btn-manual-refresh");
+    const refreshIcon = document.getElementById("refresh-icon");
+    const searchInput = document.getElementById("search-input");
+    const filterTabs = document.querySelectorAll(".tab-btn");
+    const safetyModal = document.getElementById("safety-modal");
+    const modalClientsList = document.getElementById("modal-clients-list");
+    const btnModalCancel = document.getElementById("btn-modal-cancel");
+    const btnModalForce = document.getElementById("btn-modal-force");
+    const toastContainer = document.getElementById("toast-container");
+
+    // Formatear duración en segundos a texto legible
+    function formatDuration(sec) {
+      if (sec <= 0) return "¡Listo!";
+      const d = Math.floor(sec / 86400);
+      const h = Math.floor((sec % 86400) / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = Math.floor(sec % 60);
+      if (d > 0) return `${d}d ${h}h ${m}m ${s}s`;
+      if (h > 0) return `${h}h ${m}m ${s}s`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    // Toast emergente
+    function showToast(message, type = "info") {
+      const toast = document.createElement("div");
+      toast.className = `toast ${type}`;
+      toast.innerHTML = `<span>${message}</span>`;
+      toastContainer.appendChild(toast);
+      setTimeout(() => toast.classList.add("show"), 10);
+      setTimeout(() => {
+        toast.classList.remove("show");
+        setTimeout(() => toast.remove(), 300);
+      }, 3500);
+    }
+
+    // Copiar al portapapeles
+    function copyToClipboard(text, msg = "Copiado al portapapeles") {
+      navigator.clipboard.writeText(text).then(() => {
+        showToast(msg, "success");
+      }).catch(() => {
+        showToast("Error al copiar", "error");
+      });
+    }
+
+    // Consultar estado de la API
+    async function fetchStatus(isManual = false) {
+      if (isManual) {
+        refreshIcon.classList.add("spinning");
+        btnManualRefresh.disabled = true;
+      }
+      try {
+        const resp = await fetch("/api/status");
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        appData = await resp.json();
+        renderAccounts();
+        updateMetrics();
+        if (isManual) showToast("Datos actualizados correctamente", "success");
+      } catch (err) {
+        console.error("Error al obtener estado:", err);
+        showToast("Error al conectar con el servidor local", "error");
+      } finally {
+        if (isManual) {
+          setTimeout(() => {
+            refreshIcon.classList.remove("spinning");
+            btnManualRefresh.disabled = false;
+          }, 400);
+        }
+        secondsUntilRefresh = autoRefreshInterval;
+      }
+    }
+
+    // Realizar cambio de cuenta
+    async function requestSwitch(provider, account, force = false) {
+      try {
+        const resp = await fetch("/api/switch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider, account, force }),
+        });
+        const data = await resp.json();
+
+        if (data.status === "warning" && !force) {
+          pendingSwitch = { provider, account };
+          modalClientsList.innerHTML = (data.clients || []).map(c => `
+            <div>• PID ${c.pid} en ${c.tty || "?"}: ${c.cmd} ${c.elapsed ? `(${c.elapsed})` : ""}</div>
+          `).join("");
+          safetyModal.classList.add("open");
+          return;
+        }
+
+        if (data.status === "ok") {
+          showToast(`✓ ${data.message}`, "success");
+          safetyModal.classList.remove("open");
+          pendingSwitch = null;
+          await fetchStatus(false);
+        } else {
+          showToast(data.message || "Error al cambiar de cuenta", "error");
+        }
+      } catch (err) {
+        showToast("Error de conexión al cambiar de cuenta", "error");
+      }
+    }
+
+    // Renderizar métricas globales
+    function updateMetrics() {
+      let total = 0;
+      let ready = 0;
+      let active = 0;
+      let codexCount = 0;
+      let agyCount = 0;
+
+      (appData.providers || []).forEach(p => {
+        (p.accounts || []).forEach(acc => {
+          total++;
+          if (acc.provider === "codex") codexCount++;
+          if (acc.provider === "agy") agyCount++;
+          if (acc.is_active) active++;
+          if (acc.status === "available") ready++;
+        });
+      });
+
+      document.getElementById("metric-total").textContent = total;
+      document.getElementById("metric-ready").textContent = ready;
+      document.getElementById("metric-active").textContent = active;
+      document.getElementById("count-all").textContent = total;
+      document.getElementById("count-codex").textContent = codexCount;
+      document.getElementById("count-agy").textContent = agyCount;
+    }
+
+    // Renderizar tarjetas de cuentas
+    function renderAccounts() {
+      const query = searchQuery.trim().toLowerCase();
+      let allAccounts = [];
+
+      (appData.providers || []).forEach(p => {
+        (p.accounts || []).forEach(acc => {
+          acc.provider_badge = p.badge;
+          acc.cli_cmd = p.cli_cmd;
+          allAccounts.push(acc);
+        });
+      });
+
+      // Filtrado por tab y búsqueda
+      const filtered = allAccounts.filter(acc => {
+        if (currentFilter !== "all" && acc.provider !== currentFilter) return false;
+        if (query) {
+          const matchName = (acc.name || "").toLowerCase().includes(query);
+          const matchEmail = (acc.email || "").toLowerCase().includes(query);
+          if (!matchName && !matchEmail) return false;
+        }
+        return true;
+      });
+
+      if (!filtered.length) {
+        accountsContainer.innerHTML = `
+          <div class="empty-state">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color: var(--text-subtle);">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="8" y1="12" x2="16" y2="12"></line>
+            </svg>
+            <h3>No se encontraron cuentas</h3>
+            <p>No hay cuentas que coincidan con el filtro actual o aún no has guardado perfiles.</p>
+            <p style="font-size: 12px;">Para registrar una: <span class="code-pill">codex-switch guardar &lt;alias&gt;</span> o <span class="code-pill">agy-switch guardar &lt;alias&gt;</span></p>
+          </div>
+        `;
+        return;
+      }
+
+      accountsContainer.innerHTML = filtered.map(acc => {
+        const isCodex = acc.provider === "codex";
+        const providerClass = isCodex ? "provider-codex" : "provider-agy";
+        const statusClass = acc.status || "available";
+
+        // Barras y cuotas
+        let quotasHtml = "";
+
+        if (acc.error) {
+          quotasHtml = `
+            <div class="card-error">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                <line x1="12" y1="9" x2="12" y2="13"></line>
+                <line x1="12" y1="17" x2="12.01" y2="17"></line>
+              </svg>
+              <span>${acc.error}</span>
+            </div>
+          `;
+        } else if (isCodex) {
+          // Codex Quotas
+          const pw = acc.primary_window;
+          const ww = acc.weekly_window;
+
+          if (pw) {
+            const barClass = pw.remaining_percent > 40 ? "bar-high" : (pw.remaining_percent > 15 ? "bar-medium" : "bar-low");
+            quotasHtml += `
+              <div class="quota-item">
+                <div class="quota-header">
+                  <span class="quota-title">⚡ Límite Corto (${pw.label})</span>
+                  <span class="quota-fraction" style="color: ${pw.remaining_percent > 40 ? '#34d399' : (pw.remaining_percent > 15 ? '#fbbf24' : '#f87171')}">
+                    ${pw.remaining_percent}% disponible
+                  </span>
+                </div>
+                <div class="progress-bar-bg">
+                  <div class="progress-bar-fill ${barClass}" style="width: ${pw.remaining_percent}%"></div>
+                </div>
+                <div class="quota-footer">
+                  <span>${pw.used_percent}% usado</span>
+                  <span class="reset-clock" data-reset-ts="${pw.reset_at_timestamp}">
+                    ⏳ Resetea en: <b>calculando...</b>
+                  </span>
+                </div>
+              </div>
+            `;
+          }
+
+          if (ww && ww !== pw) {
+            const barClass = ww.remaining_percent > 40 ? "bar-high" : (ww.remaining_percent > 15 ? "bar-medium" : "bar-low");
+            quotasHtml += `
+              <div class="quota-item">
+                <div class="quota-header">
+                  <span class="quota-title">📅 Consumo Semanal (7d)</span>
+                  <span class="quota-fraction" style="color: ${ww.remaining_percent > 40 ? '#34d399' : (ww.remaining_percent > 15 ? '#fbbf24' : '#f87171')}">
+                    ${ww.remaining_percent}% disponible
+                  </span>
+                </div>
+                <div class="progress-bar-bg">
+                  <div class="progress-bar-fill ${barClass}" style="width: ${ww.remaining_percent}%"></div>
+                </div>
+                <div class="quota-footer">
+                  <span>${ww.used_percent}% usado</span>
+                  <span class="reset-clock" data-reset-ts="${ww.reset_at_timestamp}">
+                    ⏳ Resetea en: <b>calculando...</b>
+                  </span>
+                </div>
+              </div>
+            `;
+          }
+
+          if (acc.reset_credits > 0) {
+            quotasHtml += `
+              <div class="reset-credits-badge">
+                ★ ${acc.reset_credits} crédito(s) de reinicio disponible(s)
+              </div>
+            `;
+          }
+        } else {
+          // AGY Quotas
+          const gm = acc.gemini;
+          const cl = acc.claude;
+
+          if (gm) {
+            const barClass = gm.remaining_percent > 40 ? "bar-high" : (gm.remaining_percent > 15 ? "bar-medium" : "bar-low");
+            quotasHtml += `
+              <div class="quota-item">
+                <div class="quota-header">
+                  <span class="quota-title">✦ Gemini Models (5h)</span>
+                  <span class="quota-fraction" style="color: ${gm.remaining_percent > 40 ? '#34d399' : (gm.remaining_percent > 15 ? '#fbbf24' : '#f87171')}">
+                    ${gm.remaining_percent}% disponible
+                  </span>
+                </div>
+                <div class="progress-bar-bg">
+                  <div class="progress-bar-fill ${barClass}" style="width: ${gm.remaining_percent}%"></div>
+                </div>
+                <div class="quota-footer">
+                  <span>${gm.used_percent}% usado</span>
+                  <span class="reset-clock" data-reset-ts="${gm.reset_at_timestamp}">
+                    ⏳ Resetea en: <b>calculando...</b>
+                  </span>
+                </div>
+              </div>
+            `;
+          }
+
+          if (cl) {
+            const barClass = cl.remaining_percent > 40 ? "bar-high" : (cl.remaining_percent > 15 ? "bar-medium" : "bar-low");
+            quotasHtml += `
+              <div class="quota-item">
+                <div class="quota-header">
+                  <span class="quota-title">✦ Claude 3P Models (5h)</span>
+                  <span class="quota-fraction" style="color: ${cl.remaining_percent > 40 ? '#34d399' : (cl.remaining_percent > 15 ? '#fbbf24' : '#f87171')}">
+                    ${cl.remaining_percent}% disponible
+                  </span>
+                </div>
+                <div class="progress-bar-bg">
+                  <div class="progress-bar-fill ${barClass}" style="width: ${cl.remaining_percent}%"></div>
+                </div>
+                <div class="quota-footer">
+                  <span>${cl.used_percent}% usado</span>
+                  <span class="reset-clock" data-reset-ts="${cl.reset_at_timestamp}">
+                    ⏳ Resetea en: <b>calculando...</b>
+                  </span>
+                </div>
+              </div>
+            `;
+          }
+        }
+
+        const cliCmd = `${acc.cli_cmd || "switch"} usar ${acc.name}`;
+
+        return `
+          <div class="account-card ${acc.is_active ? 'is-active' : ''}">
+            ${acc.is_active ? '<div class="active-indicator"></div>' : ''}
+            
+            <div class="card-head">
+              <div class="card-title-group">
+                <div class="card-tags">
+                  <span class="provider-pill ${providerClass}">${acc.provider_badge}</span>
+                  ${acc.is_active ? '<span class="active-badge">★ ACTIVA EN DISCO</span>' : ''}
+                </div>
+                <div class="account-name" title="${acc.name}">${acc.name}</div>
+              </div>
+
+              <div class="status-badge ${statusClass}">
+                <span class="dot"></span>
+                <span>${acc.status_text}</span>
+              </div>
+            </div>
+
+            <div class="card-meta">
+              <span class="email-display" title="${acc.email || ''}">${acc.email || 'Sin correo detectado'}</span>
+              <span class="plan-pill">${acc.plan || 'ESTÁNDAR'}</span>
+            </div>
+
+            <div class="quotas-section">
+              ${quotasHtml}
+            </div>
+
+            <div class="card-actions">
+              <button class="btn-switch" ${acc.is_active ? 'disabled' : ''} 
+                onclick="requestSwitch('${acc.provider}', '${acc.name}', false)">
+                ${acc.is_active ? '✓ Cuenta Activa' : '⚡ Usar Esta Cuenta'}
+              </button>
+              <button class="btn-icon" title="Copiar comando: ${cliCmd}" onclick="copyToClipboard('${cliCmd}')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+        `;
+      }).join("");
+
+      updateCountdowns();
+    }
+
+    // Actualizador en vivo de relojes regresivos
+    function updateCountdowns() {
+      const now = Math.floor(Date.now() / 1000);
+      document.querySelectorAll(".reset-clock").forEach(el => {
+        const resetTs = parseInt(el.getAttribute("data-reset-ts"), 10);
+        if (!resetTs || isNaN(resetTs)) return;
+        const remaining = resetTs - now;
+        if (remaining <= 0) {
+          el.className = "reset-clock ready";
+          el.innerHTML = "✓ ¡Cuota reiniciada!";
+        } else {
+          el.className = "reset-clock";
+          el.innerHTML = `⏳ Resetea en: <b>${formatDuration(remaining)}</b>`;
+        }
+      });
+    }
+
+    // Timer periódico de segundo a segundo
+    setInterval(() => {
+      updateCountdowns();
+
+      // Contador de auto-refresh
+      if (autoRefreshInterval > 0) {
+        secondsUntilRefresh--;
+        if (secondsUntilRefresh <= 0) {
+          fetchStatus(false);
+        } else {
+          const m = Math.floor(secondsUntilRefresh / 60);
+          const s = secondsUntilRefresh % 60;
+          countdownDisplay.textContent = `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+        }
+      } else {
+        countdownDisplay.textContent = "Pausa";
+      }
+    }, 1000);
+
+    // Event Listeners
+    btnManualRefresh.addEventListener("click", () => fetchStatus(true));
+
+    intervalSelect.addEventListener("change", (e) => {
+      autoRefreshInterval = parseInt(e.target.value, 10);
+      secondsUntilRefresh = autoRefreshInterval;
+      if (autoRefreshInterval === 0) {
+        countdownDisplay.textContent = "Pausa";
+      }
+    });
+
+    searchInput.addEventListener("input", (e) => {
+      searchQuery = e.target.value;
+      renderAccounts();
+    });
+
+    filterTabs.forEach(tab => {
+      tab.addEventListener("click", () => {
+        filterTabs.forEach(t => t.classList.remove("active"));
+        tab.classList.add("active");
+        currentFilter = tab.getAttribute("data-filter");
+        renderAccounts();
+      });
+    });
+
+    btnModalCancel.addEventListener("click", () => {
+      safetyModal.classList.remove("open");
+      pendingSwitch = null;
+    });
+
+    btnModalForce.addEventListener("click", () => {
+      if (pendingSwitch) {
+        requestSwitch(pendingSwitch.provider, pendingSwitch.account, true);
+      }
+    });
+
+    // Carga inicial
+    fetchStatus(false);
+  </script>
+</body>
+</html>
+"""
+
+# ==============================================================================
+# SERVIDOR HTTP REST API Y MANEJADOR
+# ==============================================================================
+
+class WidgetHTTPHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Silenciar logs ruidosos en terminal para mantener la salida limpia
+        pass
+
+    def send_json(self, status_code: int, data: dict):
+        payload = json.dumps(data, indent=2).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/":
+            payload = HTML_DASHBOARD.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if path == "/api/status":
+            params = parse_qs(parsed.query)
+            filter_provider = params.get("filter", [""])[0]
+
+            results = []
+            providers_to_check = [
+                p for p in PROVIDERS.values()
+                if not filter_provider or p.id == filter_provider
+            ]
+
+            with ThreadPoolExecutor(max_workers=len(providers_to_check) or 1) as pool:
+                results = list(pool.map(lambda p: p.get_status(), providers_to_check))
+
+            self.send_json(200, {
+                "timestamp": int(time.time()),
+                "providers": results,
+            })
+            return
+
+        if path == "/api/clients":
+            running = {}
+            for p_id, prov in PROVIDERS.items():
+                running[p_id] = prov.get_running_clients()
+            self.send_json(200, {"clients": running})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/switch":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception:
+                self.send_json(400, {"status": "error", "message": "JSON inválido"})
+                return
+
+            prov_id = body.get("provider", "")
+            account = body.get("account", "")
+            force = bool(body.get("force", False))
+
+            provider = PROVIDERS.get(prov_id)
+            if not provider:
+                self.send_json(404, {"status": "error", "message": f"Proveedor '{prov_id}' desconocido"})
+                return
+
+            if not account:
+                self.send_json(400, {"status": "error", "message": "Nombre de cuenta requerido"})
+                return
+
+            ok, msg, clients = provider.switch_account(account, force=force)
+            if not ok and clients and not force:
+                self.send_json(200, {
+                    "status": "warning",
+                    "message": msg,
+                    "clients": clients,
+                })
+                return
+
+            if ok:
+                self.send_json(200, {"status": "ok", "message": msg})
+            else:
+                self.send_json(400, {"status": "error", "message": msg})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+
+# ==============================================================================
+# LANZAMIENTO MULTIPLATAFORMA (DESKTOP / NATIVE WINDOW / BROWSER)
+# ==============================================================================
+
+def open_desktop_widget(url: str, app_mode: bool = True):
+    """
+    Intenta abrir el widget en una ventana de aplicación dedicada e independiente
+    (sin pestañas ni barra de URL), compatible con Linux, macOS y Windows.
+    """
+    if not app_mode:
+        import webbrowser
+        webbrowser.open(url)
+        return
+
+    # Comandos de navegadores que soportan modo aplicación (--app)
+    browsers = [
+        # Linux / Windows / Mac
+        ["google-chrome", f"--app={url}", "--window-size=480,780"],
+        ["chromium-browser", f"--app={url}", "--window-size=480,780"],
+        ["chromium", f"--app={url}", "--window-size=480,780"],
+        ["brave-browser", f"--app={url}", "--window-size=480,780"],
+        ["brave", f"--app={url}", "--window-size=480,780"],
+        ["msedge", f"--app={url}", "--window-size=480,780"],
+    ]
+
+    # En Windows, msedge está siempre presente
+    if sys.platform.startswith("win"):
+        edge_paths = [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+        for ep in edge_paths:
+            if os.path.isfile(ep):
+                browsers.insert(0, [ep, f"--app={url}", "--window-size=480,780"])
+
+    # En macOS, Google Chrome o Edge via open
+    if sys.platform == "darwin":
+        browsers.insert(0, ["open", "-na", "Google Chrome", "--args", f"--app={url}", "--window-size=480,780"])
+        browsers.insert(1, ["open", "-na", "Microsoft Edge", "--args", f"--app={url}", "--window-size=480,780"])
+
+    for b in browsers:
+        exe = b[0]
+        if shutil.which(exe) or (os.path.isabs(exe) and os.path.isfile(exe)):
+            try:
+                subprocess.Popen(b, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except Exception:
+                pass
+
+    # Fallback al navegador estándar del sistema
+    try:
+        import webbrowser
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def find_free_port(start_port: int = 4920, max_attempts: int = 20) -> int:
+    for port in range(start_port, start_port + max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    return start_port
+
+
+# ==============================================================================
+# PUNTO DE ENTRADA PRINCIPAL
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="CLI Account Switch · Desktop Widget (Monitor de Cuotas, Tokens y Consumo Semanal)"
+    )
+    parser.add_argument("-p", "--port", type=int, default=4920, help="Puerto local del servidor (por defecto 4920)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host al que vincular el servidor (por defecto 127.0.0.1)")
+    parser.add_argument("-f", "--filter", type=str, choices=["all", "codex", "agy"], default="all", help="Filtro predeterminado")
+    parser.add_argument("--no-browser", action="store_true", help="No abrir la interfaz gráfica automáticamente")
+    parser.add_argument("--browser-tab", action="store_true", help="Abrir como pestaña del navegador en vez de ventana de app dedicada")
+
+    args = parser.parse_args()
+
+    port = find_free_port(args.port)
+    server_address = (args.host, port)
+
+    try:
+        httpd = ThreadingHTTPServer(server_address, WidgetHTTPHandler)
+    except OSError as e:
+        print(f"❌ Error al iniciar servidor en {args.host}:{port}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    url = f"http://{args.host}:{port}"
+
+    print("\n╭─────────────────────────────────────────────────────────────╮")
+    print("│  ✦ CLI Account Switch · Desktop Widget                      │")
+    print("╰─────────────────────────────────────────────────────────────╯")
+    print(f"  • URL Local    : \033[1;36m{url}\033[0m")
+    print("  • Proveedores  : \033[1;32mOpenAI Codex\033[0m & \033[1;35mGoogle Antigravity (AGY)\033[0m")
+    print("  • Actualización: Automática en vivo + botón manual")
+    print("  • Métricas     : Cuotas 5h, Consumo Semanal (7d) y Tiempo de Reinicio")
+    print("  • Detener      : Presiona Ctrl+C en esta terminal\n")
+
+    # Si hay pantalla o interfaz gráfica disponible y no se especificó --no-browser
+    has_display = bool(
+        os.environ.get("DISPLAY")
+        or os.environ.get("WAYLAND_DISPLAY")
+        or sys.platform in ("win32", "darwin")
+    )
+
+    if not args.no_browser and has_display:
+        t = threading.Thread(
+            target=open_desktop_widget,
+            args=(url, not args.browser_tab),
+            daemon=True,
+        )
+        t.start()
+    elif not has_display:
+        print("  💡 Servidor iniciado en segundo plano. Abre la URL en tu navegador:")
+        print(f"     \033[1m{url}\033[0m\n")
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nCerrando servidor del Widget... ¡Hasta luego!")
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    main()

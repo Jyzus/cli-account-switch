@@ -1,12 +1,12 @@
 # CLI Account Switch
 
-Gestores de perfiles locales para **Codex CLI** (`codex-switch`) y **Antigravity CLI** (`agy-switch`). Guarda una autenticación con un alias, cambia de perfil y reanuda tus conversaciones desde la terminal.
+Gestores de perfiles locales para **Codex CLI** (`codex-switch`) y **Antigravity CLI** (`agy-switch`), acompañados de un **Desktop Widget multiplataforma** (`switch-widget`). Guarda una autenticación con un alias, cambia de perfil, monitorea cuotas y reanuda tus conversaciones desde la terminal o desde tu escritorio.
 
 Proyecto independiente, sin afiliación con los proveedores de las herramientas.
 
 ## Instalación
 
-Requisitos: Python 3.9 o posterior, Bash y la CLI correspondiente instalada y autenticada. Pensado para Linux, macOS y WSL; las comprobaciones automatizadas se ejecutan en Linux. No instala Codex ni Antigravity.
+Requisitos: Python 3.9 o posterior. Pensado para **Linux**, **macOS** y **Windows** (WSL / PowerShell / CMD). No requiere dependencias externas ni compiladores C/C++. No instala Codex ni Antigravity.
 
 ```bash
 git clone https://github.com/Jyzus/cli-account-switch.git
@@ -14,20 +14,61 @@ cd cli-account-switch
 ./install.sh
 ```
 
-El destino predeterminado es `~/.local/bin`. Si no está en tu `PATH`, añade a `~/.bashrc` o `~/.zshrc`:
+El destino predeterminado en sistemas Unix es `~/.local/bin`. Si no está en tu `PATH`, añade a `~/.bashrc` o `~/.zshrc`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Puedes elegir otro destino: `INSTALL_DIR=/ruta/bin ./install.sh`.
+En **Windows**, puedes ejecutar `switch-widget.bat` directamente o añadir la carpeta `bin\` a tu variable de entorno `PATH`.
 
-## Uso
+Puedes elegir otro destino en Unix: `INSTALL_DIR=/ruta/bin ./install.sh`.
+
+## Desktop Widget Multiplataforma (`switch-widget`)
+
+Un widget visual flotante con diseño moderno (Glassmorphism oscuro) que monitorea todas tus cuentas en segundo plano:
+
+```bash
+# Lanzar el widget completo (Codex y AGY):
+switch-widget
+
+# O lanzarlo directamente desde cualquiera de las CLIs:
+codex-switch widget
+agy-switch widget
+```
+
+### Características del Widget:
+- **Multiplataforma**: Funciona de forma nativa en **Linux**, **macOS** y **Windows**. Se abre automáticamente en modo aplicación dedicado (ventana independiente sin pestañas ni barra de URL mediante Chromium, Google Chrome, Brave o Microsoft Edge).
+- **Actualización automática periódica**: Configurable desde la barra superior (1 min, 3 min, 5 min por defecto, 10 min, 15 min o Pausar) con temporizador regresivo en vivo (`⏱ 04:32`).
+- **Botón de actualización manual**: Botón `↺ Actualizar` con retroalimentación inmediata y animación de carga para forzar la consulta en vivo de todas las cuentas al instante.
+- **Relojes de reinicio en tiempo real**: Contadores regresivos que descuentan segundo a segundo (`⏳ Resetea en: 2h 45m 12s` o `4d 18h 22m`), alertando en verde cuando la cuota se resetea.
+- **Consumo Semanal (7 días) y Límite Corto (5 horas)**:
+  - Visualización gráfica detallada con barras de progreso de degradado dinámico (verde para cuota alta, ámbar para media, rojo para agotada).
+  - Porcentaje consumido y porcentaje restante de la cuota semanal.
+  - Para OpenAI Codex: Límite primario (5h), Consumo semanal (7d) y créditos de reinicio disponibles.
+  - Para Antigravity: Límites independientes para modelos Gemini (Flash/Pro) y modelos de terceros (Claude 3P / Opus / Sonnet).
+- **Cambio de cuenta en 1 clic**: Cambia la cuenta activa directamente desde la tarjeta con el botón `⚡ Usar Esta Cuenta`.
+- **Protección contra rotura de sesiones**: Si tienes terminales activas con la cuenta actual, el widget despliega un aviso modal con los PIDs y terminales en ejecución para evitar desconexiones accidentales, permitiéndote cancelar o forzar el cambio (`--force`).
+- **Búsqueda y filtros**: Filtra al instante por proveedor (`Todos`, `OpenAI Codex`, `Google AGY`) o busca por alias o correo electrónico.
+
+### Opciones de la línea de comandos de `switch-widget`:
+```bash
+switch-widget --port 4920           # Personalizar el puerto local
+switch-widget --host 0.0.0.0        # Permitir acceso desde otros equipos o móvil en la misma red
+switch-widget --filter codex        # Filtrar inicialmente solo Codex (o agy)
+switch-widget --no-browser          # Modo servidor sin abrir ventana automáticamente
+switch-widget --browser-tab         # Abrir en pestaña estándar de navegador
+```
+
+## Uso por Terminal (CLI)
 
 ```bash
 # Consultar cuota, tokens restantes y tiempo de reseteo en vivo:
 codex-switch status              # o: codex-switch tokens
 codex-switch status personal     # consulta una cuenta específica
+
+# Abrir el widget gráfico de escritorio:
+codex-switch widget              # o: switch-widget
 
 # Gestión de cuentas:
 codex-switch guardar personal
@@ -39,6 +80,7 @@ codex-switch continuar
 # Lo mismo para Antigravity CLI:
 agy-switch status                # o: agy-switch tokens
 agy-switch status personal
+agy-switch widget                # abre el widget gráfico
 agy-switch guardar personal
 agy-switch nueva trabajo
 agy-switch listar
