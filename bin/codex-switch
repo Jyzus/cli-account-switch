@@ -7,12 +7,18 @@ preservando el historial de la sesión intacto.
 
 import sys
 import os
+import time
 import json
 import base64
 import shutil
 import re
 import subprocess
 import tempfile
+import urllib.request
+import urllib.parse
+import urllib.error
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 def validate_alias(nombre: str):
@@ -98,7 +104,125 @@ def find_active_profile_name(cuentas_dir: Path, auth_path: Path) -> str:
             continue
     return "(sin guardar / temporal)"
 
-def cmd_status():
+def format_duration(seconds: float) -> str:
+    if seconds <= 0:
+        return "ahora"
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if mins > 0 and days == 0:
+        parts.append(f"{mins}m")
+    return " ".join(parts) if parts else "<1m"
+
+
+def render_bar(fraction_remaining: float, width: int = 10) -> str:
+    fraction = max(0.0, min(1.0, fraction_remaining))
+    filled = int(round(fraction * width))
+    bar = "█" * filled + "░" * (width - filled)
+    pct = int(round(fraction * 100))
+    if pct > 40:
+        color = "\033[1;32m"  # verde
+    elif pct > 15:
+        color = "\033[1;33m"  # amarillo
+    else:
+        color = "\033[1;31m"  # rojo
+    return f"{color}[{bar}] {pct:3d}%\033[0m"
+
+
+def refresh_codex_token(profile_path: Path, data: dict, active_profile: str = "") -> bool:
+    tokens = data.get("tokens", {})
+    rt = tokens.get("refresh_token")
+    cid = (tokens.get("oauth_provenance") or {}).get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann"
+    if not rt:
+        return False
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": rt,
+        "client_id": cid,
+    }).encode()
+    req = urllib.request.Request(
+        "https://auth.openai.com/oauth/token",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "codex-cli"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            res = json.loads(resp.read().decode())
+            if "access_token" in res:
+                tokens["access_token"] = res["access_token"]
+                if "refresh_token" in res:
+                    tokens["refresh_token"] = res["refresh_token"]
+                if "id_token" in res:
+                    tokens["id_token"] = res["id_token"]
+                data["tokens"] = tokens
+                data["last_refresh"] = datetime.now(timezone.utc).isoformat()
+                
+                # Guardar atómicamente el perfil refrescado
+                content = json.dumps(data, indent=2).encode("utf-8")
+                write_auth_atomic(profile_path, content)
+                
+                # Si este perfil es el activo en disco, sincronizar auth.json
+                if active_profile and profile_path.stem == active_profile:
+                    auth_path = get_auth_path()
+                    write_auth_atomic(auth_path, content)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def fetch_codex_quota(profile_path: Path, active_profile: str = "") -> dict:
+    try:
+        data = json.loads(profile_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"err_msg": f"Archivo ilegible: {e}"}
+
+    tokens = data.get("tokens", {})
+    access_token = tokens.get("access_token")
+    account_id = tokens.get("account_id")
+    api_key = data.get("OPENAI_API_KEY")
+
+    if api_key and not access_token:
+        return {"type": "api_key", "email": "API Key de OpenAI"}
+
+    if not access_token:
+        return {"err_msg": "Sin token de acceso"}
+
+    def do_request(tok: str) -> dict:
+        headers = {
+            "Authorization": f"Bearer {tok}",
+            "User-Agent": "codex-cli",
+            "Accept": "application/json",
+        }
+        if account_id:
+            headers["ChatGPT-Account-Id"] = account_id
+        req = urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode())
+
+    try:
+        return do_request(access_token)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            if refresh_codex_token(profile_path, data, active_profile=active_profile):
+                new_token = data.get("tokens", {}).get("access_token")
+                try:
+                    return do_request(new_token)
+                except Exception as e2:
+                    return {"err_msg": f"HTTP {e.code} tras refresco ({e2})"}
+            return {"err_msg": "Sesión expirada (requiere login o codex-switch nueva)", "expired": True}
+        return {"err_msg": f"HTTP {e.code}: {e.reason}"}
+    except Exception as e:
+        return {"err_msg": f"Sin conexión / {e}"}
+
+
+def cmd_listar():
     auth_path = get_auth_path()
     cuentas_dir = get_cuentas_dir()
     account_info = decode_account_from_auth(auth_path)
@@ -106,21 +230,16 @@ def cmd_status():
     last_sid = get_most_recent_session_id()
 
     print("\n╭─────────────────────────────────────────────────────────────╮")
-    print("│  ✦ CODEX Multi-Cuenta · Gestor de Sesiones & Tokens         │")
+    print("│  ✦ CODEX Multi-Cuenta · Perfiles Guardados (Offline)        │")
     print("╰─────────────────────────────────────────────────────────────╯")
     print(f"  • Cuenta en disco: \033[1;32m{account_info}\033[0m")
     print(f"  • Perfil guardado: \033[1;36m{active_profile}\033[0m")
     if last_sid:
         print(f"  • Última sesión  : \033[1;33m{last_sid}\033[0m")
-        print(f"    (Para continuar: codex-switch continuar  o  codex resume --last)")
-    else:
-        print(f"  • Última sesión  : (sin sesiones registradas)")
+    print(f"  • Credenciales   : {auth_path}")
 
     guardadas = list(cuentas_dir.glob("*.json"))
-    print(f"  • Credenciales   : {auth_path}")
-    print("  Aviso: este estado lee el archivo; no verifica la cuenta de procesos abiertos.")
-    print("  usar <nombre> reinicia el servidor persistente activo; reconecta la aplicación.")
-    print("\n  Cuentas disponibles:")
+    print("\n  Cuentas disponibles en disco:")
     if not guardadas:
         print("    (No hay cuentas guardadas todavía. Usa: codex-switch guardar <nombre>)")
     else:
@@ -128,14 +247,109 @@ def cmd_status():
             p_name = f.stem
             p_acc = decode_account_from_auth(f)
             check = "★ [EN DISCO]" if p_name == active_profile else "  "
-            print(f"    {check} \033[1m{p_name:12}\033[0m → {p_acc}")
+            print(f"    {check} \033[1m{p_name:14}\033[0m → {p_acc}")
+    print("\n  Tip: Usa 'codex-switch status' para consultar tokens y límites restantes en tiempo real.\n")
+
+
+def cmd_status(target: str = ""):
+    auth_path = get_auth_path()
+    cuentas_dir = get_cuentas_dir()
+    account_info = decode_account_from_auth(auth_path)
+    active_profile = find_active_profile_name(cuentas_dir, auth_path)
+    last_sid = get_most_recent_session_id()
+
+    print("\n╭─────────────────────────────────────────────────────────────╮")
+    print("│  ✦ CODEX Multi-Cuenta · Estado de Cuotas & Tokens en Vivo  │")
+    print("╰─────────────────────────────────────────────────────────────╯")
+    print(f"  • Cuenta en disco: \033[1;32m{account_info}\033[0m")
+    print(f"  • Perfil activo  : \033[1;36m{active_profile}\033[0m")
+    if last_sid:
+        print(f"  • Última sesión  : \033[1;33m{last_sid}\033[0m (Para continuar: codex-switch continuar)")
+
+    guardadas = sorted(cuentas_dir.glob("*.json"))
+    if target:
+        guardadas = [f for f in guardadas if f.stem == target]
+        if not guardadas:
+            print(f"\n❌ Error: La cuenta '{target}' no existe en {cuentas_dir}.")
+            print("   Usa 'codex-switch listar' para ver los perfiles existentes.")
+            sys.exit(1)
+
+    if not guardadas:
+        print("\n  (No hay cuentas guardadas todavía. Usa: codex-switch guardar <nombre>)")
+        return
+
+    print("\n  Consultando cuota y tokens de cada cuenta...")
+
+    def check_one(path: Path):
+        return path, fetch_codex_quota(path, active_profile=active_profile)
+
+    with ThreadPoolExecutor(max_workers=min(len(guardadas), 8) or 1) as pool:
+        results = list(pool.map(check_one, guardadas))
+
+    disponibles = []
+    print("\n  Estado de Cuentas:")
+    for f, q in results:
+        p_name = f.stem
+        is_active = (p_name == active_profile)
+        check_mark = "★ [EN DISCO]" if is_active else " " * 12
+
+        err = q.get("err_msg")
+        if err:
+            print(f"\n  {check_mark} \033[1m{p_name:14}\033[0m ⚠️  \033[1;31m{err}\033[0m")
+            continue
+
+        if q.get("type") == "api_key":
+            print(f"\n  {check_mark} \033[1m{p_name:14}\033[0m [API KEY] \033[1;32m🟢 ACTIVA\033[0m")
+            print("      Uso facturado por consumo directo de OpenAI API Key.")
+            disponibles.append(p_name)
+            continue
+
+        email = q.get("email") or decode_account_from_auth(f)
+        plan = (q.get("plan_type") or "desconocido").upper()
+        rate = q.get("rate_limit") or {}
+        allowed = rate.get("allowed", True)
+        pw = rate.get("primary_window") or {}
+        sw = rate.get("secondary_window") or {}
+
+        if allowed:
+            status_tag = "\033[1;32m🟢 DISPONIBLE\033[0m"
+            disponibles.append(p_name)
+        else:
+            status_tag = "\033[1;31m🔴 AGOTADO\033[0m"
+
+        print(f"\n  {check_mark} \033[1m{p_name:14}\033[0m [{plan}] {status_tag} → {email}")
+
+        p_used = pw.get("used_percent", 0)
+        p_rem_frac = max(0.0, 1.0 - (p_used / 100.0))
+        p_res = pw.get("reset_after_seconds", 0)
+        p_window_sec = pw.get("limit_window_seconds", 18000)
+        p_win_label = f"{int(p_window_sec // 3600)}h" if p_window_sec < 86400 else f"{int(p_window_sec // 86400)}d"
+        p_res_str = f"resetea en {format_duration(p_res)}" if p_res > 0 else "reseteado"
+        print(f"      Cuota {p_win_label:3}: {render_bar(p_rem_frac)} restante · {p_used}% usado ({p_res_str})")
+
+        if sw:
+            s_used = sw.get("used_percent", 0)
+            s_rem_frac = max(0.0, 1.0 - (s_used / 100.0))
+            s_res = sw.get("reset_after_seconds", 0)
+            s_res_str = f"resetea en {format_duration(s_res)}" if s_res > 0 else "reseteado"
+            print(f"      Cuota Sem: {render_bar(s_rem_frac)} restante · {s_used}% usado ({s_res_str})")
+
+        reset_credits = q.get("rate_limit_reset_credits", {}).get("available_count", 0)
+        if reset_credits > 0:
+            print(f"      Créditos : \033[1;33m★ {reset_credits} crédito(s) de reset disponible(s)\033[0m")
+
+    if disponibles:
+        disp_str = ", ".join(f"\033[1;36m{d}\033[0m" for d in disponibles)
+        print(f"\n  💡 Cuentas con tokens disponibles ahora: {disp_str}")
+        if active_profile not in disponibles and disponibles:
+            print(f"     Sugerencia: cambia a una con: \033[1;33mcodex-switch usar {disponibles[0]}\033[0m")
 
     print("\n  Comandos frecuentes:")
-    print("    codex-switch guardar <nombre>   Guarda la sesión actual bajo un alias")
-    print("    codex-switch usar <nombre>      Cambia credenciales y reinicia el servidor activo")
-    print("    codex-switch nueva <nombre> [--device-auth] Inicia sesión con una cuenta adicional")
-    print("    codex-switch continuar          Continúa la última tarea con la cuenta activa")
-    print("    codex-switch id                 Muestra sólo el ID de la sesión más reciente\n")
+    print("    codex-switch status [nombre]    Consulta cuotas y tokens en vivo (alias: tokens, cuota)")
+    print("    codex-switch usar <nombre>      Cambia de cuenta y reinicia el daemon activo")
+    print("    codex-switch listar             Lista rápida de cuentas en disco (offline)")
+    print("    codex-switch nueva <nombre>     Inicia sesión con una cuenta adicional")
+    print("    codex-switch continuar          Reanuda la última tarea\n")
 
 def cmd_guardar(nombre: str):
     validate_alias(nombre)
@@ -207,15 +421,165 @@ def run_daemon_action(action: str) -> bool:
     print(f"❌ No se pudo ejecutar: codex app-server daemon {action}", flush=True)
     return False
 
-def cmd_usar(nombre: str):
+def find_running_clients(tool: str = "codex") -> list:
+    """Detecta procesos interactivos / clientes abiertos del CLI en el equipo."""
+    current_pid = os.getpid()
+    clients = []
+
+    btime = 0
+    try:
+        with open("/proc/stat", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    btime = int(line.split()[1])
+                    break
+    except Exception:
+        pass
+    clock_ticks = os.sysconf(os.sysconf_names.get("SC_CLK_TCK", 100)) or 100
+    now = time.time()
+
+    proc_dir = Path("/proc")
+    if proc_dir.is_dir():
+        for proc in proc_dir.glob("[0-9]*"):
+            try:
+                pid = int(proc.name)
+                if pid == current_pid:
+                    continue
+                stat_file = proc / "stat"
+                if not stat_file.exists():
+                    continue
+                stat_parts = stat_file.read_text().rsplit(")", 1)[1].split()
+                if stat_parts[0] == "Z":  # Ignorar zombies
+                    continue
+
+                cmd_file = proc / "cmdline"
+                if not cmd_file.exists():
+                    continue
+                raw = cmd_file.read_bytes()
+                if not raw:
+                    continue
+                args = [a.decode("utf-8", errors="ignore") for a in raw.split(b"\0") if a]
+                if not args:
+                    continue
+
+                cmd_str = " ".join(args)
+                exe = os.path.basename(args[0])
+
+                if "switch" in exe or "switch" in cmd_str:
+                    continue
+
+                is_client = False
+                if tool == "codex":
+                    if exe in ("codex", "codex.real") or "codex" in args[0]:
+                        is_daemon = any(flag in cmd_str for flag in [
+                            "--managed-daemon",
+                            "pid-update-loop",
+                            "app-server-daemon",
+                            "daemon-updater",
+                        ])
+                        if not is_daemon:
+                            is_client = True
+                    elif exe in ("codex-code-mode-host", "codex-exec-server"):
+                        is_client = True
+                elif tool == "agy":
+                    if exe in ("agy", "agy.real") or "agy" in args[0]:
+                        is_client = True
+
+                if not is_client:
+                    continue
+
+                tty = "?"
+                try:
+                    fd0 = os.readlink(proc / "fd" / "0")
+                    if fd0.startswith("/dev/pts/") or fd0.startswith("/dev/tty"):
+                        tty = fd0.replace("/dev/", "")
+                except Exception:
+                    pass
+
+                if tty == "?":
+                    tty_nr = int(stat_parts[4])
+                    if tty_nr != 0:
+                        tty = f"tty-{tty_nr}"
+                    else:
+                        tty = "segundo plano"
+
+                elapsed_str = ""
+                try:
+                    start_ticks = int(stat_parts[19])
+                    start_sec = btime + (start_ticks / clock_ticks)
+                    elapsed = max(0, int(now - start_sec))
+                    m, s = divmod(elapsed, 60)
+                    h, m = divmod(m, 60)
+                    if h > 0:
+                        elapsed_str = f"hace {h}h {m}m"
+                    elif m > 0:
+                        elapsed_str = f"hace {m}m"
+                    else:
+                        elapsed_str = f"hace {s}s"
+                except Exception:
+                    pass
+
+                clients.append({
+                    "pid": pid,
+                    "exe": exe,
+                    "tty": tty,
+                    "cmd": cmd_str,
+                    "elapsed": elapsed_str,
+                })
+            except (OSError, ValueError):
+                continue
+    return clients
+
+
+def cmd_usar(nombre: str, force: bool = False):
     validate_alias(nombre)
     if not nombre or nombre in (".", "..") or "/" in nombre or "\\" in nombre:
-        print("❌ Especifica un alias válido: codex-switch usar <nombre>")
+        print("❌ Especifica un alias válido: codex-switch usar <nombre> [--force]")
         sys.exit(1)
     src = get_cuentas_dir() / f"{nombre}.json"
     if not src.is_file():
         print(f"❌ La cuenta '{nombre}' no existe. Usa: codex-switch listar")
         sys.exit(1)
+
+    auth_path = get_auth_path()
+    cuentas_dir = get_cuentas_dir()
+    active_profile = find_active_profile_name(cuentas_dir, auth_path)
+    if nombre == active_profile:
+        account_info = decode_account_from_auth(auth_path)
+        print(f"ℹ️ La cuenta '\033[1;36m{nombre}\033[0m' ({account_info}) ya está seleccionada y activa en disco.")
+        return
+
+    # Verificación de seguridad: detectar sesiones/chats activos de Codex
+    running_clients = find_running_clients("codex")
+    if running_clients and not force:
+        account_info = decode_account_from_auth(auth_path)
+        print("\n╭─────────────────────────────────────────────────────────────╮")
+        print("│  ⛔ CAMBIO CANCELADO POR SEGURIDAD                          │")
+        print("╰─────────────────────────────────────────────────────────────╯")
+        print(f"  • Cuenta activa actual : \033[1;32m{account_info}\033[0m ({active_profile})")
+        print(f"  • Cuenta a seleccionar : \033[1;36m{nombre}\033[0m")
+        print(f"\n  ⚠️  Se detectaron {len(running_clients)} sesión(es)/chat(s) de Codex en ejecución en este equipo:")
+        for c in running_clients:
+            pid = c["pid"]
+            tty = c["tty"]
+            cmd = c["cmd"]
+            el = c["elapsed"]
+            el_text = f" [{el}]" if el else ""
+            print(f"     → \033[1mPID {pid}\033[0m en \033[1;33m{tty}\033[0m: {cmd}{el_text}")
+
+        print("\n  🛡️  ¿Por qué se canceló el cambio?")
+        print("     Cambiar de cuenta mientras tienes chats abiertos desconectaría esas sesiones,")
+        print("     interrumpiría tareas en curso e invalidaría los tokens de tu cuenta actual.")
+        print("\n  Para cambiar de forma segura:")
+        print("     1. Ve a las terminales indicadas arriba y cierra las sesiones (/exit o Ctrl+D).")
+        print(f"     2. Vuelve a ejecutar: \033[1mcodex-switch usar {nombre}\033[0m")
+        print("\n  Si eres consciente del riesgo y deseas forzar el cambio:")
+        print(f"     \033[1;31mcodex-switch usar {nombre} --force\033[0m\n")
+        sys.exit(1)
+
+    if running_clients and force:
+        print(f"\n⚠️  Advertencia: Forzando cambio de cuenta (--force) con {len(running_clients)} proceso(s) activo(s)...", flush=True)
+
     try:
         selected = src.read_bytes()
         data = json.loads(selected)
@@ -227,7 +591,6 @@ def cmd_usar(nombre: str):
         print("❌ El perfil no contiene credenciales válidas; no se cambió la cuenta.")
         sys.exit(1)
 
-    auth_path = get_auth_path()
     running = daemon_is_running()
     if running:
         # Detener primero impide que el servidor vuelva a guardar la cuenta anterior.
@@ -260,13 +623,37 @@ def cmd_usar(nombre: str):
     print("   codex-switch continuar")
 
 
-def cmd_nueva(nombre: str, device_auth: bool = False):
+def cmd_nueva(nombre: str, device_auth: bool = False, force: bool = False):
     validate_alias(nombre)
     if not nombre:
         print("❌ Error: Especifica un nombre para la nueva cuenta (ej: codex-switch nueva cuenta2)")
         sys.exit(1)
     auth_path = get_auth_path()
     cuentas_dir = get_cuentas_dir()
+
+    running_clients = find_running_clients("codex")
+    if running_clients and not force:
+        account_info = decode_account_from_auth(auth_path)
+        active_profile = find_active_profile_name(cuentas_dir, auth_path)
+        print("\n╭─────────────────────────────────────────────────────────────╮")
+        print("│  ⛔ INICIO DE SESIÓN CANCELADO POR SEGURIDAD                │")
+        print("╰─────────────────────────────────────────────────────────────╯")
+        print(f"  • Cuenta activa actual : \033[1;32m{account_info}\033[0m ({active_profile})")
+        print(f"\n  ⚠️  Hay {len(running_clients)} chat(s)/sesión(es) activa(s) de Codex abiertas en este equipo:")
+        for c in running_clients:
+            pid = c["pid"]
+            tty = c["tty"]
+            cmd = c["cmd"]
+            el = c["elapsed"]
+            el_text = f" [{el}]" if el else ""
+            print(f"     → \033[1mPID {pid}\033[0m en \033[1;33m{tty}\033[0m: {cmd}{el_text}")
+        print("\n  Iniciar sesión con otra cuenta ahora reemplazará tus credenciales y puede")
+        print("  romper o cerrar esas conversaciones.")
+        print(f"\n  Cierra las sesiones indicadas o usa: \033[1;31mcodex-switch nueva {nombre} --force\033[0m\n")
+        sys.exit(1)
+
+    if running_clients and force:
+        print(f"\n⚠️  Advertencia: Forzando inicio de sesión (--force) con {len(running_clients)} proceso(s) activo(s)...", flush=True)
 
     if auth_path.is_file():
         actual = find_active_profile_name(cuentas_dir, auth_path)
@@ -319,25 +706,29 @@ def cmd_continuar(args: list[str]):
 
 def main():
     args = sys.argv[1:]
-    if not args or args[0] in ("status", "estado", "-s"):
-        cmd_status()
+    if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
+        target = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        cmd_status(target)
     elif args[0] in ("listar", "list", "ls"):
-        cmd_status()
+        cmd_listar()
     elif args[0] in ("guardar", "save"):
         nombre = args[1] if len(args) > 1 else ""
         cmd_guardar(nombre)
     elif args[0] in ("usar", "use", "switch"):
-        nombre = args[1] if len(args) > 1 else ""
-        cmd_usar(nombre)
+        nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        force = any(a in ("--force", "-f") for a in args[1:])
+        cmd_usar(nombre, force=force)
     elif args[0] in ("nueva", "new", "login", "login-nueva"):
-        nombre = args[1] if len(args) > 1 else ""
-        options = args[2:]
-        unknown = [option for option in options if option != "--device-auth"]
+        nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        options = [a for a in args[1:] if a != nombre]
+        device_auth = "--device-auth" in options
+        force = any(a in ("--force", "-f") for a in options)
+        unknown = [option for option in options if option not in ("--device-auth", "--force", "-f")]
         if unknown:
             print(f"Opción no reconocida para nueva cuenta: {unknown[0]}")
-            print("Uso: codex-switch nueva <nombre> [--device-auth]")
+            print("Uso: codex-switch nueva <nombre> [--device-auth] [--force]")
             sys.exit(2)
-        cmd_nueva(nombre, device_auth="--device-auth" in options)
+        cmd_nueva(nombre, device_auth=device_auth, force=force)
     elif args[0] in ("continuar", "continue", "resume", "-c"):
         cmd_continuar(args[1:])
     elif args[0] in ("id", "hash"):
@@ -346,9 +737,19 @@ def main():
             print(sid)
         else:
             sys.exit(1)
+    elif args[0] in ("ayuda", "help", "--help", "-h"):
+        print("Uso: codex-switch [comando] [argumentos]")
+        print("\nComandos disponibles:")
+        print("  status [nombre]   Consulta en vivo tokens, cuotas y límites restantes (alias: tokens, cuota)")
+        print("  listar            Lista rápida de cuentas en disco sin consultar red (offline)")
+        print("  guardar <nombre>  Guarda las credenciales activas bajo un alias")
+        print("  usar <nombre>     Cambia a la cuenta indicada y reinicia el daemon")
+        print("  nueva <nombre>    Inicia sesión interactiva para registrar una nueva cuenta")
+        print("  continuar         Reanuda la última conversación registrada")
+        print("  id                Muestra el identificador de la última sesión")
     else:
         print(f"Comando desconocido: {args[0]}")
-        print("Uso: codex-switch [status | guardar <nombre> | usar <nombre> | nueva <nombre> [--device-auth] | continuar | id]")
+        print("Uso: codex-switch [status [nombre] | tokens | listar | guardar <nombre> | usar <nombre> | nueva <nombre> | continuar | id]")
         sys.exit(1)
 
 if __name__ == "__main__":
