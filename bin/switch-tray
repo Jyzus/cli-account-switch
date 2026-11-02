@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+"""
+CLI Account Switch · Taskbar / System Tray Widget
+Monitor ultraligero de cuotas y tokens en la barra de tareas / bandeja del sistema.
+Compatible con Linux (AppIndicator/Ayatana), Windows y macOS.
+Bajo consumo de recursos (0% CPU en reposo, ~15MB RAM).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+# ==============================================================================
+# CARGA DE MÓDULOS DE CODEX Y AGY
+# ==============================================================================
+
+def find_module_file(name: str) -> Path | None:
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / name,
+        Path.home() / ".local" / "bin" / name,
+        Path("/usr/local/bin") / name,
+    ]
+    which = shutil.which(name)
+    if which:
+        candidates.insert(0, Path(which))
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def load_cli_module(name: str):
+    f = find_module_file(name)
+    if not f:
+        return None
+    try:
+        # Si es un binario ELF compilado (ej. PyInstaller), no se puede importar directamente
+        header = f.read_bytes()[:4]
+        if header == b"\x7fELF" or header[:2] == b"MZ":
+            return None
+        mod_name = name.replace("-", "_")
+        return SourceFileLoader(mod_name, str(f)).load_module()
+    except Exception:
+        return None
+
+
+# ==============================================================================
+# GESTIÓN DE AUTO-INICIO CON LA COMPUTADORA (AUTOSTART)
+# ==============================================================================
+
+def get_autostart_path() -> Path:
+    if sys.platform.startswith("win"):
+        appdata = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
+        return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "switch-tray.bat"
+    elif sys.platform == "darwin":
+        return Path.home() / "Library" / "LaunchAgents" / "com.user.switch-tray.plist"
+    else:  # Linux / Unix
+        xdg_config = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        return Path(xdg_config) / "autostart" / "switch-tray.desktop"
+
+
+def is_autostart_enabled() -> bool:
+    return get_autostart_path().is_file()
+
+
+def enable_autostart() -> bool:
+    p = get_autostart_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if sys.platform.startswith("win"):
+            p.write_text(
+                '@echo off\nstart "" pythonw "%USERPROFILE%\\.local\\bin\\switch-tray"\n',
+                encoding="utf-8",
+            )
+        elif sys.platform == "darwin":
+            content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.switch-tray</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{sys.executable}</string>
+        <string>{Path.home()}/.local/bin/switch-tray</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>"""
+            p.write_text(content, encoding="utf-8")
+        else:  # Linux
+            content = (
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Version=1.0\n"
+                "Name=CLI Account Switch Tray\n"
+                "GenericName=AI Agent Token Monitor\n"
+                "Comment=Monitor de tokens y cuotas en la barra de tareas\n"
+                "Exec=sh -c 'PATH=\"$HOME/.local/bin:$PATH\" switch-tray'\n"
+                "Icon=utilities-system-monitor\n"
+                "Terminal=false\n"
+                "Categories=Utility;Development;\n"
+                "X-GNOME-Autostart-enabled=true\n"
+                "StartupNotify=false\n"
+            )
+            p.write_text(content, encoding="utf-8")
+            p.chmod(0o644)
+        return True
+    except Exception as e:
+        print(f"Error al habilitar autostart: {e}", file=sys.stderr)
+        return False
+
+
+def disable_autostart() -> bool:
+    p = get_autostart_path()
+    try:
+        if p.is_file():
+            p.unlink()
+        return True
+    except Exception as e:
+        print(f"Error al deshabilitar autostart: {e}", file=sys.stderr)
+        return False
+
+
+# ==============================================================================
+# GENERACIÓN DE ICONOS DE ESTADO (SVG)
+# ==============================================================================
+
+def ensure_tray_icons() -> dict[str, str]:
+    icon_dir = Path.home() / ".local" / "share" / "icons" / "cli-account-switch"
+    icon_dir.mkdir(parents=True, exist_ok=True)
+
+    icons = {
+        "green": icon_dir / "tray-green.svg",
+        "yellow": icon_dir / "tray-yellow.svg",
+        "red": icon_dir / "tray-red.svg",
+        "error": icon_dir / "tray-error.svg",
+    }
+
+    svgs = {
+        "green": (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">'
+            '<circle cx="12" cy="12" r="10" fill="#10b981" stroke="#059669" stroke-width="2"/>'
+            '<circle cx="12" cy="12" r="4.5" fill="#ffffff" opacity="0.95"/>'
+            '</svg>'
+        ),
+        "yellow": (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">'
+            '<circle cx="12" cy="12" r="10" fill="#f59e0b" stroke="#d97706" stroke-width="2"/>'
+            '<circle cx="12" cy="12" r="4.5" fill="#ffffff" opacity="0.95"/>'
+            '</svg>'
+        ),
+        "red": (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">'
+            '<circle cx="12" cy="12" r="10" fill="#ef4444" stroke="#dc2626" stroke-width="2"/>'
+            '<circle cx="12" cy="12" r="4.5" fill="#ffffff" opacity="0.95"/>'
+            '</svg>'
+        ),
+        "error": (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">'
+            '<circle cx="12" cy="12" r="10" fill="#e11d48" stroke="#9f1239" stroke-width="2"/>'
+            '<path d="M12 7v6M12 16v1" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round"/>'
+            '</svg>'
+        ),
+    }
+
+    for k, p in icons.items():
+        if not p.is_file():
+            try:
+                p.write_text(svgs[k], encoding="utf-8")
+            except Exception:
+                pass
+
+    return {k: str(p) for k, p in icons.items()}
+
+
+# ==============================================================================
+# RECOLECCIÓN DE DATOS DE TOKENS Y CUOTAS (LIGERA Y ASÍNCRONA)
+# ==============================================================================
+
+def format_duration(sec: int) -> str:
+    if sec <= 0:
+        return "reseteado"
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m, _ = divmod(sec, 60)
+    if d > 0:
+        return f"{d}d {h}h"
+    if h > 0:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def fetch_tray_status() -> dict:
+    codex_mod = load_cli_module("codex-switch")
+    agy_mod = load_cli_module("agy-switch")
+
+    status = {
+        "timestamp": int(time.time()),
+        "codex": {
+            "active_name": "",
+            "active_email": "",
+            "available_pct": None,
+            "weekly_pct": None,
+            "reset_str": "",
+            "error": None,
+            "all_accounts": [],
+        },
+        "agy": {
+            "active_name": "",
+            "active_email": "",
+            "gemini_pct": None,
+            "claude_pct": None,
+            "reset_str": "",
+            "error": None,
+            "all_accounts": [],
+        },
+    }
+
+    # 1. Codex Quota
+    if codex_mod:
+        try:
+            auth_path = codex_mod.get_auth_path()
+            cuentas_dir = codex_mod.get_cuentas_dir()
+            active_name = codex_mod.find_active_profile_name(cuentas_dir, auth_path)
+            status["codex"]["active_name"] = active_name or "sin guardar"
+            status["codex"]["active_email"] = codex_mod.decode_account_from_auth(auth_path)
+
+            all_files = sorted(cuentas_dir.glob("*.json"))
+            status["codex"]["all_accounts"] = [f.stem for f in all_files]
+
+            is_valid_saved = bool(active_name and not active_name.startswith("(") and (cuentas_dir / f"{active_name}.json").is_file())
+            target_file = (cuentas_dir / f"{active_name}.json") if is_valid_saved else auth_path
+            if target_file.is_file():
+                q = codex_mod.fetch_codex_quota(target_file, active_profile=active_name)
+                err = q.get("err_msg")
+                if err:
+                    status["codex"]["error"] = err
+                else:
+                    rate = q.get("rate_limit") or {}
+                    pw = rate.get("primary_window")
+                    sw = rate.get("secondary_window")
+                    if pw:
+                        used = pw.get("used_percent", 0)
+                        status["codex"]["available_pct"] = max(0, 100 - used)
+                        res_sec = pw.get("reset_after_seconds", 0)
+                        status["codex"]["reset_str"] = format_duration(res_sec)
+                    if sw:
+                        s_used = sw.get("used_percent", 0)
+                        status["codex"]["weekly_pct"] = max(0, 100 - s_used)
+                    elif pw and pw.get("limit_window_seconds", 0) >= 86400 * 5:
+                        status["codex"]["weekly_pct"] = status["codex"]["available_pct"]
+        except Exception as e:
+            status["codex"]["error"] = str(e)
+
+    # 2. AGY Quota
+    if agy_mod:
+        try:
+            token_path = agy_mod.get_token_path()
+            cuentas_dir = agy_mod.get_cuentas_dir()
+            active_name = agy_mod.find_active_profile_name(cuentas_dir, token_path)
+            status["agy"]["active_name"] = active_name or "sin guardar"
+            status["agy"]["active_email"] = agy_mod.decode_email_from_token(token_path)
+
+            all_files = sorted(cuentas_dir.glob("*.token"))
+            status["agy"]["all_accounts"] = [f.stem for f in all_files]
+
+            is_valid_saved = bool(active_name and not active_name.startswith("(") and (cuentas_dir / f"{active_name}.token").is_file())
+            target_file = (cuentas_dir / f"{active_name}.token") if is_valid_saved else token_path
+            if target_file.is_file():
+                q = agy_mod.fetch_agy_quota(target_file, active_profile=active_name)
+                err = q.get("err_msg")
+                if err:
+                    status["agy"]["error"] = err
+                else:
+                    models = q.get("models") or {}
+                    now_dt = datetime.now(timezone.utc)
+                    # Gemini
+                    gm = (
+                        models.get("gemini-2.5-flash")
+                        or models.get("gemini-2.5-pro")
+                        or models.get("gemini-3-flash")
+                        or models.get("gemini-3.5-flash-lite")
+                        or models.get("gemini-3.1-flash-lite")
+                        or {}
+                    )
+                    g_frac = gm.get("quotaInfo", {}).get("remainingFraction", 1.0)
+                    status["agy"]["gemini_pct"] = int(round(g_frac * 100))
+
+                    # Claude
+                    cl = (
+                        models.get("claude-sonnet-5-5-high")
+                        or models.get("claude-sonnet-5-5-medium")
+                        or models.get("claude-opus-5-5-medium")
+                        or models.get("claude-opus-5-5-high")
+                        or models.get("claude-opus-4-6-thinking")
+                        or {}
+                    )
+                    c_frac = cl.get("quotaInfo", {}).get("remainingFraction", 1.0)
+                    status["agy"]["claude_pct"] = int(round(c_frac * 100))
+
+                    g_res = gm.get("quotaInfo", {}).get("resetTime", "")
+                    if g_res:
+                        try:
+                            dt = datetime.fromisoformat(g_res.replace("Z", "+00:00"))
+                            sec = max(0, int((dt - now_dt).total_seconds()))
+                            status["agy"]["reset_str"] = format_duration(sec)
+                        except Exception:
+                            pass
+        except Exception as e:
+            status["agy"]["error"] = str(e)
+
+    return status
+
+
+# ==============================================================================
+# IMPLEMENTACIÓN NATIVA EN LINUX CON AYATANA / APPINDICATOR (GTK3)
+# ==============================================================================
+
+class LinuxAppIndicatorTray:
+    def __init__(self, interval: int = 300):
+        self.interval = max(30, interval)
+        self.icons = ensure_tray_icons()
+        self.current_status: dict = {}
+        self.indicator = None
+
+    def start(self):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        has_ayatana = False
+        try:
+            gi.require_version("AyatanaAppIndicator3", "0.1")
+            from gi.repository import AyatanaAppIndicator3 as AppIndicator
+            has_ayatana = True
+        except (ValueError, ImportError):
+            try:
+                gi.require_version("AppIndicator3", "0.1")
+                from gi.repository import AppIndicator3 as AppIndicator
+            except (ValueError, ImportError):
+                print("❌ No se encontró AyatanaAppIndicator3 ni AppIndicator3.", file=sys.stderr)
+                print("   Instala: sudo apt install gir12.1-ayatanaappindicator3-0.1", file=sys.stderr)
+                sys.exit(1)
+
+        from gi.repository import Gtk, GLib
+
+        self.Gtk = Gtk
+        self.GLib = GLib
+
+        # Verificar si hay una pantalla gráfica accesible
+        success, _ = Gtk.init_check(None)
+        if not success:
+            print("⚠️ No se detectó un servidor gráfico (DISPLAY no configurado).", file=sys.stderr)
+            print("   Si estás en SSH, ejecuta switch-tray en tu sesión de escritorio gráfica.", file=sys.stderr)
+            print("   O habilita el auto-arranque con: switch-tray --autostart enable", file=sys.stderr)
+            sys.exit(1)
+
+        initial_icon = self.icons.get("green", "utilities-system-monitor")
+        self.indicator = AppIndicator.Indicator.new(
+            "cli-account-switch-tray",
+            initial_icon,
+            AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("CLI Account Switch")
+
+        # Construir menú inicial
+        self.menu = Gtk.Menu()
+        self.indicator.set_menu(self.menu)
+
+        # Iniciar hilo de recolección en segundo plano
+        t = threading.Thread(target=self._worker_loop, daemon=True)
+        t.start()
+
+        # Iniciar loop principal de GTK
+        Gtk.main()
+
+    def _worker_loop(self):
+        while True:
+            data = fetch_tray_status()
+            self.GLib.idle_add(self._apply_data, data)
+            time.sleep(self.interval)
+
+    def trigger_refresh(self):
+        def worker():
+            data = fetch_tray_status()
+            self.GLib.idle_add(self._apply_data, data)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_data(self, data: dict):
+        self.current_status = data
+        codex = data.get("codex", {})
+        agy = data.get("agy", {})
+
+        c_pct = codex.get("available_pct")
+        g_pct = agy.get("gemini_pct")
+
+        # Texto del panel en la barra de tareas
+        labels = []
+        if c_pct is not None:
+            labels.append(f"Codex: {c_pct}%")
+        elif codex.get("error"):
+            labels.append("Codex: ⚠️")
+
+        if g_pct is not None:
+            labels.append(f"AGY: {g_pct}%")
+        elif agy.get("error"):
+            labels.append("AGY: ⚠️")
+
+        panel_text = " | ".join(labels) if labels else "AI Tokens"
+        self.indicator.set_label(panel_text, "Codex: 100% | AGY: 100%")
+
+        # Determinar icono según el peor porcentaje
+        all_pcts = [p for p in (c_pct, g_pct) if p is not None]
+        if codex.get("error") or agy.get("error"):
+            icon_key = "error"
+        elif not all_pcts:
+            icon_key = "yellow"
+        elif min(all_pcts) <= 15:
+            icon_key = "red"
+        elif min(all_pcts) <= 40:
+            icon_key = "yellow"
+        else:
+            icon_key = "green"
+
+        icon_path = self.icons.get(icon_key, "utilities-system-monitor")
+        self.indicator.set_icon_full(icon_path, panel_text)
+
+        # Reconstruir menú desplegable
+        self._rebuild_menu()
+
+    def _rebuild_menu(self):
+        Gtk = self.Gtk
+        menu = Gtk.Menu()
+        codex = self.current_status.get("codex", {})
+        agy = self.current_status.get("agy", {})
+
+        # Encabezado
+        title = Gtk.MenuItem(label="✦ CLI Account Switch")
+        title.set_sensitive(False)
+        menu.append(title)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Estado Codex
+        c_acc = codex.get("active_name") or "(ninguna)"
+        c_pct = codex.get("available_pct")
+        c_res = codex.get("reset_str")
+        c_err = codex.get("error")
+
+        if c_err:
+            c_text = f"Codex [{c_acc}]: ⚠️ {c_err}"
+        elif c_pct is not None:
+            res_info = f" · resetea en {c_res}" if c_res else ""
+            c_text = f"Codex [{c_acc}]: {c_pct}% disp{res_info}"
+        else:
+            c_text = f"Codex [{c_acc}]: Sin datos de cuota"
+
+        item_codex = Gtk.MenuItem(label=c_text)
+        item_codex.set_sensitive(False)
+        menu.append(item_codex)
+
+        # Estado AGY
+        a_acc = agy.get("active_name") or "(ninguna)"
+        g_pct = agy.get("gemini_pct")
+        c3_pct = agy.get("claude_pct")
+        a_res = agy.get("reset_str")
+        a_err = agy.get("error")
+
+        if a_err:
+            a_text = f"AGY [{a_acc}]: ⚠️ {a_err}"
+        elif g_pct is not None:
+            res_info = f" ({a_res})" if a_res else ""
+            a_text = f"AGY [{a_acc}]: Gemini {g_pct}% · Claude {c3_pct}%{res_info}"
+        else:
+            a_text = f"AGY [{a_acc}]: Sin datos de cuota"
+
+        item_agy = Gtk.MenuItem(label=a_text)
+        item_agy.set_sensitive(False)
+        menu.append(item_agy)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Submenú: Cambiar cuenta Codex
+        c_accounts = codex.get("all_accounts") or []
+        if c_accounts:
+            sub_codex = Gtk.Menu()
+            for acc in c_accounts:
+                mark = "✓ " if acc == c_acc else "  "
+                sub_item = Gtk.MenuItem(label=f"{mark}{acc}")
+                sub_item.connect("activate", self._make_switch_cb("codex", acc))
+                sub_codex.append(sub_item)
+            item_switch_c = Gtk.MenuItem(label="Cambiar cuenta Codex ▸")
+            item_switch_c.set_submenu(sub_codex)
+            menu.append(item_switch_c)
+
+        # Submenú: Cambiar cuenta AGY
+        a_accounts = agy.get("all_accounts") or []
+        if a_accounts:
+            sub_agy = Gtk.Menu()
+            for acc in a_accounts:
+                mark = "✓ " if acc == a_acc else "  "
+                sub_item = Gtk.MenuItem(label=f"{mark}{acc}")
+                sub_item.connect("activate", self._make_switch_cb("agy", acc))
+                sub_agy.append(sub_item)
+            item_switch_a = Gtk.MenuItem(label="Cambiar cuenta AGY ▸")
+            item_switch_a.set_submenu(sub_agy)
+            menu.append(item_switch_a)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Botón Actualizar
+        item_refresh = Gtk.MenuItem(label="↻ Actualizar ahora")
+        item_refresh.connect("activate", lambda _: self.trigger_refresh())
+        menu.append(item_refresh)
+
+        # Botón Abrir Widget Completo
+        item_open_widget = Gtk.MenuItem(label="📊 Abrir Monitor Completo (Widget)")
+        item_open_widget.connect("activate", lambda _: self._open_full_widget())
+        menu.append(item_open_widget)
+
+        # Toggle Autostart
+        autostart_active = is_autostart_enabled()
+        auto_label = "⚙️ Iniciar con el sistema [✓ Activado]" if autostart_active else "⚙️ Iniciar con el sistema [Desactivado]"
+        item_autostart = Gtk.MenuItem(label=auto_label)
+        item_autostart.connect("activate", self._toggle_autostart)
+        menu.append(item_autostart)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Salir
+        item_exit = Gtk.MenuItem(label="❌ Salir")
+        item_exit.connect("activate", lambda _: Gtk.main_quit())
+        menu.append(item_exit)
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+    def _make_switch_cb(self, provider: str, account: str):
+        def cb(_):
+            def worker():
+                mod_name = "codex-switch" if provider == "codex" else "agy-switch"
+                mod = load_cli_module(mod_name)
+                if mod and hasattr(mod, "find_running_clients"):
+                    try:
+                        running = mod.find_running_clients(provider)
+                        if running:
+                            # Notificar conflicto de sesiones en la consola/registro
+                            print(f"⚠️ Advertencia: Sesiones activas de {provider} en pts/. Conmutación abortada.")
+                            return
+                    except Exception:
+                        pass
+
+                exe = find_module_file(mod_name)
+                if exe:
+                    subprocess.run([sys.executable, str(exe), "usar", account], capture_output=True)
+                    self.trigger_refresh()
+            threading.Thread(target=worker, daemon=True).start()
+        return cb
+
+    def _open_full_widget(self):
+        w_exe = find_module_file("switch-widget")
+        if w_exe:
+            subprocess.Popen([sys.executable, str(w_exe)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _toggle_autostart(self, _):
+        if is_autostart_enabled():
+            disable_autostart()
+        else:
+            enable_autostart()
+        self._rebuild_menu()
+
+
+# ==============================================================================
+# FALLBACK: PYSTRAY (WINDOWS / MACOS)
+# ==============================================================================
+
+class PystrayFallbackTray:
+    def __init__(self, interval: int = 300):
+        self.interval = max(30, interval)
+
+    def start(self):
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+        except ImportError:
+            print("❌ Para usar el widget de bandeja en Windows/macOS, instala pystray:")
+            print("   pip install pystray pillow")
+            sys.exit(1)
+
+        def create_image(color: str):
+            image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            draw.ellipse((8, 8, 56, 56), fill=color, outline="#ffffff")
+            return image
+
+        def on_exit(icon, _):
+            icon.stop()
+
+        def on_open_widget(icon, _):
+            w_exe = find_module_file("switch-widget")
+            if w_exe:
+                subprocess.Popen([sys.executable, str(w_exe)])
+
+        icon = pystray.Icon(
+            "cli-account-switch",
+            create_image("#10b981"),
+            "CLI Account Switch",
+            menu=pystray.Menu(
+                pystray.MenuItem("CLI Account Switch", None, enabled=False),
+                pystray.MenuItem("Abrir Monitor Completo", on_open_widget),
+                pystray.MenuItem("Salir", on_exit),
+            ),
+        )
+
+        icon.run()
+
+
+# ==============================================================================
+# PUNTO DE ENTRADA PRINCIPAL
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="CLI Account Switch · Taskbar Widget (Monitor de tokens en barra de tareas con bajo consumo)"
+    )
+    parser.add_argument("-i", "--interval", type=int, default=300, help="Intervalo de consulta en segundos (por defecto 300s = 5 min)")
+    parser.add_argument("--autostart", choices=["enable", "disable", "status"], help="Gestionar auto-inicio al encender la computadora")
+    parser.add_argument("--status", action="store_true", help="Consultar estado rápido en la terminal y salir")
+    parser.add_argument("--daemon", action="store_true", help="Modo servicio de fondo continuo sin GUI")
+
+    args = parser.parse_args()
+
+    # Gestión de Autostart
+    if args.autostart:
+        if args.autostart == "enable":
+            ok = enable_autostart()
+            if ok:
+                print(f"✅ Auto-inicio habilitado: {get_autostart_path()}")
+            else:
+                sys.exit(1)
+        elif args.autostart == "disable":
+            ok = disable_autostart()
+            if ok:
+                print("✅ Auto-inicio deshabilitado.")
+            else:
+                sys.exit(1)
+        elif args.autostart == "status":
+            enabled = is_autostart_enabled()
+            st_text = "\033[1;32mHABILITADO\033[0m" if enabled else "\033[1;33mDESHABILITADO\033[0m"
+            print(f"Auto-inicio con la computadora: {st_text}")
+            print(f"Archivo de configuración: {get_autostart_path()}")
+        return
+
+    # Consulta rápida en terminal
+    if args.status:
+        data = fetch_tray_status()
+        c = data.get("codex", {})
+        a = data.get("agy", {})
+        print("\n✦ Estado rápido de tokens para la barra de tareas:")
+        print(f"  • Codex: [{c.get('active_name')}] {c.get('available_pct')}% disponible (resetea en {c.get('reset_str') or 'N/A'})")
+        print(f"  • AGY  : [{a.get('active_name')}] Gemini {a.get('gemini_pct')}% · Claude {a.get('claude_pct')}%")
+        print(f"  • Auto-inicio al encender PC: {'Activado' if is_autostart_enabled() else 'Desactivado'}\n")
+        return
+
+    # Iniciar en modo barra de tareas
+    print("Iniciando widget en la barra de tareas / system tray...")
+    print(f"  • Intervalo de chequeo: {args.interval}s")
+    print(f"  • Auto-inicio con el sistema: {'Activado' if is_autostart_enabled() else 'Desactivado'}")
+
+    # En Linux: AppIndicator
+    if not sys.platform.startswith("win") and sys.platform != "darwin":
+        tray = LinuxAppIndicatorTray(interval=args.interval)
+        try:
+            tray.start()
+        except KeyboardInterrupt:
+            print("\nCerrando widget de bandeja...")
+    else:
+        # Windows / macOS fallback con pystray
+        tray = PystrayFallbackTray(interval=args.interval)
+        try:
+            tray.start()
+        except KeyboardInterrupt:
+            print("\nCerrando widget de bandeja...")
+
+
+if __name__ == "__main__":
+    main()

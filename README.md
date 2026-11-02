@@ -1,6 +1,6 @@
 # CLI Account Switch
 
-Gestores de perfiles locales para **Codex CLI** (`codex-switch`) y **Antigravity CLI** (`agy-switch`), acompañados de un **Desktop Widget multiplataforma** (`switch-widget`). Guarda una autenticación con un alias, cambia de perfil, monitorea cuotas y reanuda tus conversaciones desde la terminal o desde tu escritorio.
+Gestores de perfiles locales para **Codex CLI** (`codex-switch`) y **Antigravity CLI** (`agy-switch`), acompañados de un **Widget de Barra de Tareas / Bandeja del Sistema ultraligero** (`switch-tray`) y un **Desktop Dashboard flotante** (`switch-widget`). Guarda una autenticación con un alias, cambia de perfil en 1 clic, monitorea cuotas en tiempo real con mínimo consumo y reanuda tus conversaciones desde la terminal o desde tu entorno de escritorio.
 
 Proyecto independiente, sin afiliación con los proveedores de las herramientas.
 
@@ -72,6 +72,45 @@ switch-widget --no-browser          # Modo servidor sin abrir ventana automátic
 switch-widget --browser-tab         # Abrir en pestaña estándar de navegador
 ```
 
+## Taskbar / System Tray Widget (`switch-tray`)
+
+Diseñado específicamente para **mantenerse siempre activo con el mínimo consumo de recursos** (0% CPU en reposo y ~15MB RAM). Muestra el estado de tokens y cuotas directamente en la barra de tareas o bandeja del sistema y se inicializa automáticamente al arrancar tu computadora:
+
+```bash
+# Iniciar el widget en la barra de tareas:
+switch-tray
+
+# O lanzarlo directamente desde cualquiera de las CLIs:
+codex-switch tray
+agy-switch tray
+```
+
+### Características del Widget de Barra de Tareas:
+- **Consumo Mínimo de Recursos**: Integrado de forma nativa con **AyatanaAppIndicator3 / Gtk 3** en Linux (GNOME, KDE Plasma, Ubuntu, XFCE) y `pystray` en Windows/macOS. Sin dependencias pesadas de navegadores ni frameworks web.
+- **Etiqueta en vivo en el panel**: Visualiza tus tokens de un vistazo directo sin abrir menús:  
+  `Codex: 100% | AGY: 91%` (o alertas visuales de estado ⚠️).
+- **Iconos dinámicos SVG**: Indicador visual inteligente en el panel (Verde para cuota óptima >40%, Ámbar para cuota media ≤40%, Rojo para cuota crítica ≤15% o Agotada, y Carmesí para errores).
+- **Menú contextual interactivo (clic derecho / clic)**:
+  - **Detalle de cada cuenta activa**: Muestra el nombre de perfil, porcentaje de disponibilidad y tiempo restante de reinicio (`Codex [cuenta1]: 100% disp · resetea en 5h 0m`).
+  - **Cambio de cuenta rápido en submenús**: `Cambiar cuenta Codex ▸` y `Cambiar cuenta AGY ▸` para alternar entre cualquiera de tus cuentas guardadas con un solo clic.
+  - **Protección contra rotura de sesión**: Verifica automáticamente si hay sesiones o chats activos en terminales antes de efectuar la conmutación.
+  - **Actualización manual**: Botón `↻ Actualizar ahora` para forzar la consulta en vivo de todas las cuotas inmediatamente.
+  - **Acceso directo al dashboard completo**: Botón `📊 Abrir Monitor Completo (Widget)` para abrir la ventana visual detallada cuando requieras ver gráficos semanales.
+  - **Control de auto-arranque**: Activa o desactiva con un clic la opción `⚙️ Iniciar con el sistema [✓ Activado]`.
+- **Auto-inicio con el sistema (Autostart)**:
+  - En **Linux**: Archivo estándar XDG Autostart en `~/.config/autostart/switch-tray.desktop` (creado automáticamente al instalar o mediante el menú).
+  - En **Windows**: Acceso directo en la carpeta de Inicio de Windows (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\switch-tray.bat`).
+  - En **macOS**: Agente de inicio en `~/Library/LaunchAgents/com.user.switch-tray.plist`.
+
+### Comandos de control de `switch-tray`:
+```bash
+switch-tray --status                 # Consulta rápida del estado en la terminal
+switch-tray --autostart enable       # Activar inicio automático con la computadora
+switch-tray --autostart disable      # Desactivar inicio automático
+switch-tray --autostart status       # Comprobar si el auto-inicio está activo
+switch-tray -i 600                   # Cambiar intervalo de sondeo a 10 minutos (por defecto: 300s = 5m)
+```
+
 ## Uso por Terminal (CLI)
 
 ```bash
@@ -79,8 +118,9 @@ switch-widget --browser-tab         # Abrir en pestaña estándar de navegador
 codex-switch status              # o: codex-switch tokens
 codex-switch status personal     # consulta una cuenta específica
 
-# Abrir el widget gráfico de escritorio:
-codex-switch widget              # o: switch-widget
+# Abrir el widget en la barra de tareas o el widget gráfico de escritorio:
+codex-switch tray                # o: switch-tray (bajo consumo)
+codex-switch widget              # o: switch-widget (dashboard flotante)
 
 # Gestión de cuentas:
 codex-switch guardar personal
@@ -92,7 +132,8 @@ codex-switch continuar
 # Lo mismo para Antigravity CLI:
 agy-switch status                # o: agy-switch tokens
 agy-switch status personal
-agy-switch widget                # abre el widget gráfico
+agy-switch tray                  # widget de barra de tareas
+agy-switch widget                # abre el dashboard gráfico flotante
 agy-switch guardar personal
 agy-switch nueva trabajo
 agy-switch listar

@@ -720,6 +720,22 @@ def find_widget_executable() -> Path | None:
     return None
 
 
+def find_tray_executable() -> Path | None:
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "switch-tray",
+        Path.home() / ".local" / "bin" / "switch-tray",
+        Path("/usr/local/bin/switch-tray"),
+    ]
+    which = shutil.which("switch-tray")
+    if which:
+        candidates.insert(0, Path(which))
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
 def cmd_widget(extra_args: list):
     w = find_widget_executable()
     if not w:
@@ -727,6 +743,19 @@ def cmd_widget(extra_args: list):
         print("   Ejecuta ./install.sh para instalarlo en tu sistema.")
         sys.exit(1)
     cmd = [sys.executable, str(w), "--filter", "codex"] + extra_args
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_tray(extra_args: list):
+    t = find_tray_executable()
+    if not t:
+        print("❌ Error: No se encontró el ejecutable 'switch-tray'.")
+        print("   Ejecuta ./install.sh para instalarlo en tu sistema.")
+        sys.exit(1)
+    cmd = [sys.executable, str(t)] + extra_args
     try:
         subprocess.run(cmd)
     except KeyboardInterrupt:
@@ -762,6 +791,8 @@ def main():
         cmd_continuar(args[1:])
     elif args[0] in ("widget", "gui", "ui", "dashboard"):
         cmd_widget(args[1:])
+    elif args[0] in ("tray", "barra", "taskbar"):
+        cmd_tray(args[1:])
     elif args[0] in ("id", "hash"):
         sid = get_most_recent_session_id()
         if sid:
@@ -771,7 +802,8 @@ def main():
     elif args[0] in ("ayuda", "help", "--help", "-h"):
         print("Uso: codex-switch [comando] [argumentos]")
         print("\nComandos disponibles:")
-        print("  widget            Abre el widget gráfico multiplataforma de escritorio (alias: gui, ui)")
+        print("  tray              Inicia el widget de bajo consumo en la barra de tareas / bandeja (alias: barra)")
+        print("  widget            Abre el widget gráfico flotante de escritorio (alias: gui, ui)")
         print("  status [nombre]   Consulta en vivo tokens, cuotas y límites restantes (alias: tokens, cuota)")
         print("  listar            Lista rápida de cuentas en disco sin consultar red (offline)")
         print("  guardar <nombre>  Guarda las credenciales activas bajo un alias")
@@ -781,7 +813,7 @@ def main():
         print("  id                Muestra el identificador de la última sesión")
     else:
         print(f"Comando desconocido: {args[0]}")
-        print("Uso: codex-switch [widget | status [nombre] | tokens | listar | guardar <nombre> | usar <nombre> | nueva <nombre> | continuar | id]")
+        print("Uso: codex-switch [tray | widget | status [nombre] | tokens | listar | guardar <nombre> | usar <nombre> | nueva <nombre> | continuar | id]")
         sys.exit(1)
 
 if __name__ == "__main__":

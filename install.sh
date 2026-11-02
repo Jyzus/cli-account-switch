@@ -45,7 +45,7 @@ if [ "$USE_COMPILED" = "true" ]; then
     ARCHIVE_URL="https://github.com/${REPO}/releases/latest/download/cli-account-switch-linux-x86_64.tar.gz"
     if curl -fsSL "$ARCHIVE_URL" -o "$tmp_dir/release.tar.gz" 2>/dev/null; then
         tar -xzf "$tmp_dir/release.tar.gz" -C "$tmp_dir"
-        for name in codex-switch agy-switch switch-widget; do
+        for name in codex-switch agy-switch switch-widget switch-tray; do
             if [ -f "$tmp_dir/$name" ]; then
                 install -m 755 "$tmp_dir/$name" "$INSTALL_DIR/$name"
             fi
@@ -57,7 +57,7 @@ if [ "$USE_COMPILED" = "true" ]; then
     fi
 elif [ -n "$source_dir" ] && [ -d "$source_dir/bin" ]; then
     # Modo Local (desde el repositorio clonado)
-    for name in codex-switch agy-switch switch-widget; do
+    for name in codex-switch agy-switch switch-widget switch-tray; do
         install -m 755 "$source_dir/bin/$name" "$INSTALL_DIR/$name"
     done
     if [ -f "$source_dir/bin/switch-widget.bat" ]; then
@@ -67,7 +67,7 @@ else
     # Modo Remoto (ejecutado directamente mediante: curl -fsSL ... | bash)
     echo "🚀 Descargando e instalando CLI Account Switch desde GitHub (${REPO})..."
     RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-    for name in codex-switch agy-switch switch-widget switch-widget.bat; do
+    for name in codex-switch agy-switch switch-widget switch-widget.bat switch-tray; do
         if curl -fsSL "${RAW_BASE}/bin/${name}" -o "$tmp_dir/${name}" 2>/dev/null; then
             install -m 755 "$tmp_dir/${name}" "$INSTALL_DIR/${name}"
         fi
@@ -96,7 +96,13 @@ EOF
     printf '   Acceso directo de escritorio: %s/switch-widget.desktop\n' "$apps_dir"
 fi
 
-printf '✅ Instalados codex-switch, agy-switch y switch-widget en %s\n' "$INSTALL_DIR"
+# Configurar auto-inicio de la barra de tareas si switch-tray está presente
+if [ -x "$INSTALL_DIR/switch-tray" ]; then
+    "$INSTALL_DIR/switch-tray" --autostart enable >/dev/null 2>&1 || true
+    printf '   Auto-inicio en barra de tareas activado (switch-tray --autostart enable)\n'
+fi
+
+printf '✅ Instalados codex-switch, agy-switch, switch-widget y switch-tray en %s\n' "$INSTALL_DIR"
 case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *) printf '💡 Añade este directorio a tu PATH: export PATH="%s:\$PATH"\n' "$INSTALL_DIR" ;;
