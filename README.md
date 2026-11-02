@@ -6,7 +6,19 @@ Proyecto independiente, sin afiliación con los proveedores de las herramientas.
 
 ## Instalación
 
-Requisitos: Python 3.9 o posterior. Pensado para **Linux**, **macOS** y **Windows** (WSL / PowerShell / CMD). No requiere dependencias externas ni compiladores C/C++. No instala Codex ni Antigravity.
+### Método 1: Instalación rápida con un solo comando (Recomendado)
+
+Instala directamente sin necesidad de clonar el repositorio:
+
+```bash
+# Instalación estándar (requiere Python 3.9+):
+curl -fsSL https://raw.githubusercontent.com/Jyzus/cli-account-switch/main/install.sh | bash
+
+# O instalación con binarios precompilados independientes (sin necesidad de Python):
+curl -fsSL https://raw.githubusercontent.com/Jyzus/cli-account-switch/main/install.sh | bash -s -- --compiled
+```
+
+### Método 2: Clonando el repositorio
 
 ```bash
 git clone https://github.com/Jyzus/cli-account-switch.git
