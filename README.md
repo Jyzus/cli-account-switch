@@ -157,6 +157,7 @@ El comando `status` (o `tokens`, `cuota`, `usage`) consulta en tiempo real y en 
 
 - Codex: usa `$CODEX_HOME` o `~/.codex`. Los perfiles se guardan en `cuentas/*.json`.
 - Antigravity: usa `~/.gemini/antigravity-cli`. Los perfiles se guardan en `cuentas/*.token`.
+- **Compatibilidad con GNOME Keyring en Linux**: Antigravity CLI en entornos de escritorio Linux almacena por defecto sus credenciales en el Secret Service del sistema (GNOME Keyring / libsecret). `agy-switch` detecta y sincroniza automáticamente las credenciales entre el Keyring del sistema y el archivo de tokens local (`~/.gemini/antigravity-cli/antigravity-oauth-token`), permitiendo guardar, consultar y alternar perfiles sin discrepancias tanto en entornos gráficos de escritorio como en servidores headless.
 - Los perfiles contienen credenciales en texto claro y se escriben con permisos `600`, dentro de un directorio con permisos `700`. No los subas a Git ni los compartas.
 - Cada equipo mantiene sus propias cuentas y conversaciones. El instalador distribuye únicamente los scripts; no sincroniza datos.
 - Cambiar de perfil conserva los archivos de historial, pero la posibilidad de reanudar depende de la CLI y de los permisos de la cuenta.

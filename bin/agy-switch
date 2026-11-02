@@ -34,9 +34,192 @@ def private_copy(source: Path, destination: Path):
         with os.fdopen(fd, "wb") as stream:
             stream.write(source.read_bytes())
         os.replace(temporary, destination)
+        try:
+            destination.chmod(0o600)
+        except Exception:
+            pass
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def extract_token_from_keyring() -> str | None:
+    """Extrae el token de Antigravity almacenado en el Keyring del sistema (Secret Service / GNOME Keyring)."""
+    # 1. secret-tool CLI (nativo con libsecret-tools)
+    if shutil.which("secret-tool"):
+        try:
+            res = subprocess.run(
+                ["secret-tool", "lookup", "service", ".gemini", "username", "jetski-standalone-oauth-token"],
+                capture_output=True, text=True, timeout=3
+            )
+            val = res.stdout.strip()
+            if res.returncode == 0 and val:
+                return val
+        except Exception:
+            pass
+
+    # 2. D-Bus nativo vía python-dbus
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        sec_svc = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets")
+        svc_iface = dbus.Interface(sec_svc, "org.freedesktop.Secret.Service")
+        session = svc_iface.OpenSession("plain", dbus.String("", variant_level=1))[1]
+        attrs = dbus.Dictionary({"service": ".gemini", "username": "jetski-standalone-oauth-token"}, signature="ss")
+        unlocked, locked = svc_iface.SearchItems(attrs)
+        items = list(unlocked)
+        if not items and locked:
+            unlocked_paths, _ = svc_iface.Unlock(locked)
+            items = list(unlocked_paths)
+        if items:
+            item_obj = bus.get_object("org.freedesktop.secrets", items[0])
+            item_iface = dbus.Interface(item_obj, "org.freedesktop.Secret.Item")
+            sec_struct = item_iface.GetSecret(session)
+            raw = bytes(sec_struct[2]).decode("utf-8", errors="ignore").strip()
+            if raw:
+                return raw
+    except Exception:
+        pass
+
+    # 3. gdbus CLI de respaldo
+    if shutil.which("gdbus"):
+        try:
+            call_res = subprocess.run([
+                "gdbus", "call", "--session",
+                "--dest", "org.freedesktop.secrets",
+                "--object-path", "/org/freedesktop/secrets",
+                "--method", "org.freedesktop.Secret.Service.SearchItems",
+                "{'service': <'.gemini'>, 'username': <'jetski-standalone-oauth-token'>}"
+            ], capture_output=True, text=True, timeout=3)
+            m = re.search(r"'/org/freedesktop/secrets/[^']+'", call_res.stdout)
+            if m:
+                item_path = m.group(0).strip("'")
+                sess_res = subprocess.run([
+                    "gdbus", "call", "--session",
+                    "--dest", "org.freedesktop.secrets",
+                    "--object-path", "/org/freedesktop/secrets",
+                    "--method", "org.freedesktop.Secret.Service.OpenSession",
+                    "plain", "<''>"
+                ], capture_output=True, text=True, timeout=3)
+                m_sess = re.search(r"'/org/freedesktop/secrets/session/[^']+'", sess_res.stdout)
+                if m_sess:
+                    sess_path = m_sess.group(0).strip("'")
+                    sec_res = subprocess.run([
+                        "gdbus", "call", "--session",
+                        "--dest", "org.freedesktop.secrets",
+                        "--object-path", item_path,
+                        "--method", "org.freedesktop.Secret.Item.GetSecret",
+                        sess_path
+                    ], capture_output=True, text=True, timeout=3)
+                    bytes_match = re.findall(r"0x[0-9a-fA-F]{2}", sec_res.stdout)
+                    if bytes_match:
+                        raw = bytes([int(b, 16) for b in bytes_match]).decode("utf-8", errors="ignore").strip()
+                        if raw:
+                            return raw
+        except Exception:
+            pass
+
+    return None
+
+
+def sync_token_to_keyring(token_str: str) -> bool:
+    """Sincroniza un token en GNOME Keyring para garantizar compatibilidad con sesiones nativas de 'agy'."""
+    if not token_str:
+        return False
+    # 1. secret-tool CLI
+    if shutil.which("secret-tool"):
+        try:
+            p = subprocess.Popen(
+                ["secret-tool", "store",
+                 "--label=Password for 'jetski-standalone-oauth-token' on '.gemini'",
+                 "service", ".gemini", "username", "jetski-standalone-oauth-token"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            p.communicate(input=token_str.encode("utf-8"), timeout=3)
+            if p.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+    # 2. Python dbus
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        sec_svc = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets")
+        svc_iface = dbus.Interface(sec_svc, "org.freedesktop.Secret.Service")
+        login_coll = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets/collection/login")
+        coll_iface = dbus.Interface(login_coll, "org.freedesktop.Secret.Collection")
+        session = svc_iface.OpenSession("plain", dbus.String("", variant_level=1))[1]
+        attrs = dbus.Dictionary({"service": ".gemini", "username": "jetski-standalone-oauth-token"}, signature="ss")
+        props = dbus.Dictionary({
+            "org.freedesktop.Secret.Item.Label": dbus.String("Password for 'jetski-standalone-oauth-token' on '.gemini'"),
+            "org.freedesktop.Secret.Item.Attributes": attrs
+        }, signature="sv")
+        secret = (
+            dbus.ObjectPath(session),
+            dbus.ByteArray(b""),
+            dbus.ByteArray(token_str.encode("utf-8")),
+            dbus.String("text/plain; charset=utf8")
+        )
+        coll_iface.CreateItem(props, secret, True)
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+def clear_token_from_keyring() -> bool:
+    """Elimina el item de token de GNOME Keyring para que 'agy' lea el token del archivo de disco."""
+    # 1. secret-tool
+    if shutil.which("secret-tool"):
+        try:
+            res = subprocess.run(
+                ["secret-tool", "clear", "service", ".gemini", "username", "jetski-standalone-oauth-token"],
+                capture_output=True, timeout=3
+            )
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+    # 2. Python dbus
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        sec_svc = bus.get_object("org.freedesktop.secrets", "/org/freedesktop/secrets")
+        svc_iface = dbus.Interface(sec_svc, "org.freedesktop.Secret.Service")
+        attrs = dbus.Dictionary({"service": ".gemini", "username": "jetski-standalone-oauth-token"}, signature="ss")
+        unlocked, locked = svc_iface.SearchItems(attrs)
+        items = list(unlocked) + list(locked)
+        for item_path in items:
+            item_obj = bus.get_object("org.freedesktop.secrets", item_path)
+            item_iface = dbus.Interface(item_obj, "org.freedesktop.Secret.Item")
+            item_iface.Delete()
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+def ensure_active_token_on_disk() -> bool:
+    """Verifica si el token activo existe en disco. Si no existe, intenta extraerlo del Keyring del sistema."""
+    token_path = get_token_path(auto_sync=False)
+    if token_path.is_file() and token_path.stat().st_size > 10:
+        return True
+
+    raw_token = extract_token_from_keyring()
+    if raw_token:
+        try:
+            json.loads(raw_token)
+            token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            token_path.write_text(raw_token, encoding="utf-8")
+            token_path.chmod(0o600)
+            return True
+        except Exception:
+            pass
+    return False
 
 
 def get_base_dir() -> Path:
@@ -49,8 +232,11 @@ def get_cuentas_dir() -> Path:
     d.chmod(0o700)
     return d
 
-def get_token_path() -> Path:
-    return get_base_dir() / "antigravity-oauth-token"
+def get_token_path(auto_sync: bool = True) -> Path:
+    p = get_base_dir() / "antigravity-oauth-token"
+    if auto_sync and (not p.is_file() or p.stat().st_size <= 10):
+        ensure_active_token_on_disk()
+    return p
 
 def decode_email_from_token(token_file: Path) -> str:
     if not token_file.is_file():
@@ -186,13 +372,18 @@ def refresh_agy_token(profile_path: Path, data: dict, active_profile: str = "") 
                     stream.write(content)
                 os.replace(temporary, profile_path)
 
-                # Si es el perfil activo, actualizar antigravity-oauth-token
+                # Si es el perfil activo, actualizar antigravity-oauth-token y sincronizar keyring
                 if active_profile and profile_path.stem == active_profile:
                     token_path = get_token_path()
                     fd2, temporary2 = tempfile.mkstemp(prefix=".token-", dir=token_path.parent)
                     with os.fdopen(fd2, "wb") as stream:
                         stream.write(content)
                     os.replace(temporary2, token_path)
+                    try:
+                        token_path.chmod(0o600)
+                        sync_token_to_keyring(content.decode("utf-8"))
+                    except Exception:
+                        pass
                 return True
     except Exception:
         pass
@@ -405,8 +596,9 @@ def cmd_guardar(nombre: str):
         print("❌ Error: Especifica un nombre (ej: agy-switch guardar cuenta1)")
         sys.exit(1)
     token_path = get_token_path()
-    if not token_path.is_file():
-        print("❌ Error: No existe un token activo para guardar. Inicia sesión primero con 'agy'.")
+    if not token_path.is_file() or token_path.stat().st_size <= 10:
+        print("❌ Error: No existe un token activo para guardar.")
+        print("   Inicia sesión primero con 'agy' o añade una cuenta con: agy-switch nueva <nombre>")
         sys.exit(1)
 
     cuentas_dir = get_cuentas_dir()
@@ -579,6 +771,13 @@ def cmd_usar(nombre: str, force: bool = False):
         print(f"\n⚠️  Advertencia: Forzando cambio de cuenta (--force) con {len(running_clients)} proceso(s) activo(s)...", flush=True)
 
     private_copy(src, token_path)
+    # Sincronizar también con GNOME Keyring si está disponible
+    try:
+        raw_tok = token_path.read_text(encoding="utf-8")
+        if not sync_token_to_keyring(raw_tok):
+            clear_token_from_keyring()
+    except Exception:
+        pass
     email = decode_email_from_token(token_path)
     print(f"🔄 \033[1;32mCuenta cambiada con éxito!\033[0m")
     print(f"   Ahora activa: \033[1;36m{nombre}\033[0m ({email})")
@@ -593,7 +792,7 @@ def cmd_nueva(nombre: str, force: bool = False):
     if not nombre:
         print("❌ Error: Especifica un nombre para la nueva cuenta (ej: agy-switch nueva cuenta2)")
         sys.exit(1)
-    token_path = get_token_path()
+    token_path = get_token_path(auto_sync=False)
     cuentas_dir = get_cuentas_dir()
 
     running_clients = find_running_clients("agy")
@@ -621,17 +820,22 @@ def cmd_nueva(nombre: str, force: bool = False):
         print(f"\n⚠️  Advertencia: Forzando inicio de sesión (--force) con {len(running_clients)} proceso(s) activo(s)...", flush=True)
 
     # Si hay token activo y no está guardado, guardarlo como backup
-    if token_path.is_file():
+    if token_path.is_file() and token_path.stat().st_size > 10:
         actual = find_active_profile_name(cuentas_dir, token_path)
         if actual.startswith("(sin guardar"):
             backup = cuentas_dir / "anterior_auto.token"
             private_copy(token_path, backup)
             print(f"ℹ️ Token actual respaldado preventivamente como 'anterior_auto'.")
 
-    # Mover temporalmente el token
+    # Mover temporalmente el token actual
     temp_backup = get_base_dir() / "antigravity-oauth-token.bak"
     if token_path.is_file():
         shutil.move(token_path, temp_backup)
+
+    # Respaldar y limpiar Keyring temporalmente para que agy inicie un flujo OAuth limpio
+    keyring_backup = extract_token_from_keyring()
+    if keyring_backup:
+        clear_token_from_keyring()
 
     print("\n🚀 Preparando inicio de sesión para la nueva cuenta...")
     print("   Se abrirá 'agy'. Completa el flujo de autenticación OAuth en tu navegador.")
@@ -639,10 +843,19 @@ def cmd_nueva(nombre: str, force: bool = False):
     try:
         subprocess.run(["agy"], check=False)
     finally:
-        if token_path.is_file():
+        # Verificar token generado (en archivo o en GNOME Keyring)
+        if not token_path.is_file() or token_path.stat().st_size <= 10:
+            ensure_active_token_on_disk()
+
+        if token_path.is_file() and token_path.stat().st_size > 10:
             dest = cuentas_dir / f"{nombre}.token"
             private_copy(token_path, dest)
             email = decode_email_from_token(dest)
+            try:
+                raw_tok = token_path.read_text(encoding="utf-8")
+                sync_token_to_keyring(raw_tok)
+            except Exception:
+                pass
             print(f"\n✅ Nueva cuenta registrada y guardada como '\033[1;36m{nombre}\033[0m' ({email})!")
             if temp_backup.is_file():
                 temp_backup.unlink()
@@ -650,8 +863,17 @@ def cmd_nueva(nombre: str, force: bool = False):
             print("\n⚠️ No se detectó inicio de sesión completado. Restaurando credencial anterior...")
             if temp_backup.is_file():
                 shutil.move(temp_backup, token_path)
+            if keyring_backup:
+                sync_token_to_keyring(keyring_backup)
 
 def cmd_continuar(args: list[str]):
+    ensure_active_token_on_disk()
+    token_path = get_token_path()
+    if token_path.is_file() and token_path.stat().st_size > 10:
+        try:
+            sync_token_to_keyring(token_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     last_cid = get_most_recent_conversation_id()
     cmd = ["agy"]
     if args:
