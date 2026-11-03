@@ -123,6 +123,8 @@ codex-switch tray                # o: switch-tray (bajo consumo)
 codex-switch widget              # o: switch-widget (dashboard flotante)
 
 # Gestión de cuentas:
+codex-switch agregar trabajo         # agrega una cuenta en entorno aislado SIN cerrar tus chats activos
+codex-switch agregar trabajo --desde creds.json # importa credenciales directamente sin abrir navegador
 codex-switch guardar personal        # guarda las credenciales activas (evita duplicados automáticos)
 codex-switch eliminar antigua        # elimina un perfil guardado (alias: borrar, rm, quitar)
 codex-switch renombrar viejo nuevo   # renombra un alias existente (alias: mv, rename)
@@ -136,6 +138,8 @@ agy-switch status                # o: agy-switch tokens
 agy-switch status personal
 agy-switch tray                  # widget de barra de tareas
 agy-switch widget                # abre el dashboard gráfico flotante
+agy-switch agregar trabajo       # agrega una cuenta en entorno aislado SIN cerrar tus chats activos
+agy-switch agregar trabajo --desde token.json # importa token directamente sin abrir navegador
 agy-switch guardar personal      # guarda las credenciales activas
 agy-switch eliminar antigua      # elimina un perfil guardado (alias: borrar, rm, quitar)
 agy-switch renombrar viejo nuevo # renombra un alias existente (alias: mv, rename)
@@ -162,6 +166,7 @@ El comando `status` (o `tokens`, `cuota`, `usage`) consulta en tiempo real y en 
 - Codex: usa `$CODEX_HOME` o `~/.codex`. Los perfiles se guardan en `cuentas/*.json`.
 - Antigravity: usa `~/.gemini/antigravity-cli`. Los perfiles se guardan en `cuentas/*.token`.
 - **Compatibilidad con GNOME Keyring en Linux**: Antigravity CLI en entornos de escritorio Linux almacena por defecto sus credenciales en el Secret Service del sistema (GNOME Keyring / libsecret). `agy-switch` detecta y sincroniza automáticamente las credenciales entre el Keyring del sistema y el archivo de tokens local (`~/.gemini/antigravity-cli/antigravity-oauth-token`), permitiendo guardar, consultar y alternar perfiles sin discrepancias tanto en entornos gráficos de escritorio como en servidores headless.
+- **Agregar cuentas en entorno aislado sin interrumpir sesiones (`agregar`)**: Con `codex-switch agregar <alias>` y `agy-switch agregar <alias>` (alias: `add`), puedes autenticar y registrar cuentas adicionales para que aparezcan en tu panel de monitoreo (`switch-widget`, `switch-tray` y `status`) **sin tener que cerrar tus chats abiertos ni cambiar de cuenta activa**. La autenticación se ejecuta en un sandbox temporal aislado que no toca tu sesión activa ni archivos en uso. Además, soporta `--desde <archivo_o_json>` para importar credenciales directas sin abrir navegador.
 - **Protección contra perfiles duplicados y sobrescrituras**: Al ejecutar `guardar <alias>`, el sistema verifica automáticamente si la cuenta activa ya se encuentra guardada bajo otro perfil. Si ya existe, bloquea la duplicación innecesaria y sugiere renombrarlo con `renombrar` o forzarlo con `--force`. Asimismo, si el alias ya pertenece a otra cuenta diferente, previene la sobrescritura accidental a menos que se indique `--force`.
 - **Eliminación y renombrado ágil**: Puedes depurar cuentas guardadas con `eliminar <alias>` (o `borrar`, `rm`, `quitar`, así como desde el botón 🗑 del widget de escritorio) y renombrar perfiles con `renombrar <actual> <nuevo>` (o `mv`, `rename`) sin perder configuraciones ni tokens.
 - Los perfiles contienen credenciales en texto claro y se escriben con permisos `600`, dentro de un directorio con permisos `700`. No los subas a Git ni los compartas.
