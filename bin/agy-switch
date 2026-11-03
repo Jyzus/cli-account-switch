@@ -258,6 +258,36 @@ def decode_email_from_token(token_file: Path) -> str:
     except Exception as e:
         return f"Error al decodificar: {e}"
 
+def extract_account_key(token_file: Path) -> str:
+    """Extrae un identificador único y estable para la cuenta en agy (email, sub o token)."""
+    if not token_file.is_file():
+        return ""
+    try:
+        data = json.loads(token_file.read_text(encoding="utf-8"))
+        if data.get("id_token_email"):
+            return f"email:{data['id_token_email'].lower().strip()}"
+        tok = data.get("token") if isinstance(data.get("token"), dict) else data
+        id_token = data.get("id_token") or tok.get("id_token") or ""
+        if id_token and "." in id_token:
+            payload = id_token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            jwt = json.loads(base64.urlsafe_b64decode(payload))
+            email = jwt.get("email")
+            if email:
+                return f"email:{email.lower().strip()}"
+            sub = jwt.get("sub")
+            if sub:
+                return f"sub:{sub}"
+        rt = tok.get("refresh_token")
+        if rt:
+            return f"rt:{rt[:32]}"
+        at = tok.get("access_token")
+        if at:
+            return f"at:{at[:32]}"
+        return ""
+    except Exception:
+        return ""
+
 def get_most_recent_conversation_id() -> str:
     brain_dir = get_base_dir() / "brain"
     if not brain_dir.is_dir():
@@ -276,12 +306,24 @@ def find_active_profile_name(cuentas_dir: Path, token_path: Path) -> str:
     except Exception:
         return "(desconocido)"
 
-    for f in cuentas_dir.glob("*.token"):
+    # 1. Búsqueda exacta por contenido
+    for f in sorted(cuentas_dir.glob("*.token")):
         try:
             if f.read_bytes() == current_bytes:
                 return f.stem
         except Exception:
             continue
+
+    # 2. Búsqueda por clave de cuenta (en caso de refresco de tokens)
+    active_key = extract_account_key(token_path)
+    if active_key:
+        for f in sorted(cuentas_dir.glob("*.token")):
+            try:
+                if extract_account_key(f) == active_key:
+                    return f.stem
+            except Exception:
+                continue
+
     return "(sin guardar / temporal)"
 
 def format_duration(seconds: float) -> str:
@@ -588,9 +630,11 @@ def cmd_status(target: str = ""):
     print("    agy-switch usar <nombre>        Cambia de cuenta inmediatamente")
     print("    agy-switch listar               Lista rápida de cuentas en disco (offline)")
     print("    agy-switch nueva <nombre>       Inicia sesión con una cuenta adicional")
+    print("    agy-switch eliminar <nombre>    Elimina un perfil guardado (alias: borrar, rm)")
+    print("    agy-switch renombrar <a1> <a2>   Renombra un perfil guardado (alias: mv)")
     print("    agy-switch continuar            Continúa la última tarea con la cuenta activa\n")
 
-def cmd_guardar(nombre: str):
+def cmd_guardar(nombre: str, force: bool = False):
     validate_alias(nombre)
     if not nombre:
         print("❌ Error: Especifica un nombre (ej: agy-switch guardar cuenta1)")
@@ -603,12 +647,118 @@ def cmd_guardar(nombre: str):
 
     cuentas_dir = get_cuentas_dir()
     dest = cuentas_dir / f"{nombre}.token"
+    active_key = extract_account_key(token_path)
+    email = decode_email_from_token(token_path)
+
+    # 1. Si el archivo destino ya existe en disco, verificar si pertenece a OTRA cuenta
+    if dest.is_file() and not force:
+        dest_key = extract_account_key(dest)
+        if dest_key and active_key and dest_key != active_key:
+            old_email = decode_email_from_token(dest)
+            print(f"\n⚠️  El perfil '\033[1;36m{nombre}\033[0m' ya existe y pertenece a otra cuenta ({old_email}).")
+            print("   Guardar ahora sobrescribirá ese perfil y se perderán sus credenciales.")
+            print(f"   • Usa otro nombre o fuerza el reemplazo con: \033[1;33magy-switch guardar {nombre} --force\033[0m\n")
+            sys.exit(1)
+
+    # 2. Detección de duplicados: verificar si esta MISMA cuenta ya está guardada con otro alias
+    if not force:
+        try:
+            token_bytes = token_path.read_bytes()
+        except Exception:
+            token_bytes = b""
+
+        for f in sorted(cuentas_dir.glob("*.token")):
+            if f.stem == nombre:
+                continue
+            is_same = False
+            f_key = extract_account_key(f)
+            if active_key and f_key and active_key == f_key:
+                is_same = True
+            elif token_bytes:
+                try:
+                    if f.read_bytes() == token_bytes:
+                        is_same = True
+                except Exception:
+                    pass
+
+            if is_same:
+                existing_alias = f.stem
+                print("\n╭─────────────────────────────────────────────────────────────╮")
+                print("│  ⚠️  CUENTA YA REGISTRADA CON OTRO ALIAS                   │")
+                print("╰─────────────────────────────────────────────────────────────╯")
+                print(f"  • Cuenta activa : \033[1;32m{email}\033[0m")
+                print(f"  • Perfil actual : \033[1;36m{existing_alias}\033[0m (ya existe en disco)")
+                print(f"  • Alias nuevo   : \033[1;33m{nombre}\033[0m")
+                print("\n  Esta cuenta ya está guardada. Para evitar perfiles duplicados innecesarios:")
+                print(f"    • Renombrar el perfil existente:")
+                print(f"      \033[1;33magy-switch renombrar {existing_alias} {nombre}\033[0m")
+                print(f"    • Si realmente deseas mantener dos perfiles para la misma cuenta:")
+                print(f"      \033[1;33magy-switch guardar {nombre} --force\033[0m\n")
+                sys.exit(1)
+
+    is_update = dest.is_file()
     private_copy(token_path, dest)
-    email = decode_email_from_token(dest)
-    print(f"✅ Cuenta guardada con éxito:")
+    action_text = "actualizada" if is_update else "guardada"
+    print(f"✅ Cuenta {action_text} con éxito:")
     print(f"   Perfil : \033[1;36m{nombre}\033[0m")
     print(f"   Email  : \033[1;32m{email}\033[0m")
     print(f"   Destino: {dest}")
+
+
+def cmd_eliminar(nombre: str):
+    validate_alias(nombre)
+    if not nombre:
+        print("❌ Error: Especifica el nombre de la cuenta a eliminar (ej: agy-switch eliminar cuenta1)")
+        sys.exit(1)
+
+    cuentas_dir = get_cuentas_dir()
+    target = cuentas_dir / f"{nombre}.token"
+    if not target.is_file():
+        print(f"❌ Error: El perfil '{nombre}' no existe en {cuentas_dir}.")
+        print("   Usa 'agy-switch listar' para ver las cuentas guardadas.")
+        sys.exit(1)
+
+    email = decode_email_from_token(target)
+    token_path = get_token_path(auto_sync=False)
+    is_active = (find_active_profile_name(cuentas_dir, token_path) == nombre)
+
+    target.unlink()
+    print(f"🗑️  Perfil '\033[1;36m{nombre}\033[0m' ({email}) eliminado con éxito.")
+    if is_active:
+        print("   ℹ️  Nota: Este perfil era el que estaba activo en tu sesión actual.")
+        print("      La sesión continuará activa hasta que cambies de cuenta ('agy-switch usar <otra>')")
+        print("      o cierres sesión con 'agy /logout'.")
+
+
+def cmd_renombrar(actual: str, nuevo: str):
+    validate_alias(actual)
+    validate_alias(nuevo)
+    if not actual or not nuevo:
+        print("❌ Error: Uso: agy-switch renombrar <nombre_actual> <nuevo_nombre>")
+        sys.exit(1)
+
+    if actual == nuevo:
+        print(f"ℹ️ El nombre origen y destino son idénticos ('{actual}'). No se requieren cambios.")
+        return
+
+    cuentas_dir = get_cuentas_dir()
+    src = cuentas_dir / f"{actual}.token"
+    dst = cuentas_dir / f"{nuevo}.token"
+
+    if not src.is_file():
+        print(f"❌ Error: El perfil origen '{actual}' no existe.")
+        print("   Usa 'agy-switch listar' para ver los perfiles disponibles.")
+        sys.exit(1)
+
+    if dst.is_file():
+        print(f"❌ Error: Ya existe un perfil con el nombre '{nuevo}'.")
+        print(f"   Elimínalo primero con 'agy-switch eliminar {nuevo}' o elige otro alias.")
+        sys.exit(1)
+
+    src.rename(dst)
+    email = decode_email_from_token(dst)
+    print(f"✏️  Perfil renombrado con éxito:")
+    print(f"   '\033[1;36m{actual}\033[0m' → '\033[1;32m{nuevo}\033[0m' ({email})")
 
 def find_running_clients(tool: str = "agy") -> list:
     """Detecta procesos interactivos / clientes abiertos del CLI en el equipo."""
@@ -956,8 +1106,16 @@ def main():
     elif args[0] in ("listar", "list", "ls"):
         cmd_listar()
     elif args[0] in ("guardar", "save"):
-        nombre = args[1] if len(args) > 1 else ""
-        cmd_guardar(nombre)
+        nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        force = any(a in ("--force", "-f") for a in args[1:])
+        cmd_guardar(nombre, force=force)
+    elif args[0] in ("eliminar", "borrar", "rm", "delete", "quitar"):
+        nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        cmd_eliminar(nombre)
+    elif args[0] in ("renombrar", "mv", "rename"):
+        actual = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        nuevo = args[2] if len(args) > 2 and not args[2].startswith("-") else ""
+        cmd_renombrar(actual, nuevo)
     elif args[0] in ("usar", "use", "switch"):
         nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         force = any(a in ("--force", "-f") for a in args[1:])
@@ -987,14 +1145,16 @@ def main():
         print("  widget            Abre el widget gráfico flotante de escritorio (alias: gui, ui)")
         print("  status [nombre]   Consulta en vivo tokens, cuotas y límites restantes (alias: tokens, cuota)")
         print("  listar            Lista rápida de cuentas en disco sin consultar red (offline)")
-        print("  guardar <nombre>  Guarda las credenciales activas bajo un alias")
+        print("  guardar <nombre>  Guarda las credenciales activas bajo un alias (evita duplicados)")
+        print("  eliminar <nombre> Elimina un perfil guardado en disco (alias: borrar, quitar, rm)")
+        print("  renombrar <a1> <a2> Renombra un perfil guardado a un nuevo alias (alias: mv)")
         print("  usar <nombre>     Cambia a la cuenta indicada inmediatamente")
         print("  nueva <nombre>    Inicia sesión interactiva para registrar una nueva cuenta")
         print("  continuar         Reanuda la última conversación registrada")
         print("  id                Muestra el identificador de la última conversación")
     else:
         print(f"Comando desconocido: {args[0]}")
-        print("Uso: agy-switch [tray | widget | status [nombre] | tokens | listar | guardar <nombre> | usar <nombre> | nueva <nombre> | continuar | id]")
+        print("Uso: agy-switch [tray | widget | status [nombre] | tokens | listar | guardar <nombre> | eliminar <nombre> | renombrar <a1> <a2> | usar <nombre> | nueva <nombre> | continuar | id]")
         sys.exit(1)
 
 if __name__ == "__main__":

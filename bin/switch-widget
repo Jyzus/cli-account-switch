@@ -211,6 +211,16 @@ class CodexProvider(BaseProvider):
             return True, f"Cuenta cambiada con éxito a '{name}'", []
         return False, res.stderr.strip() or res.stdout.strip() or "Error al cambiar cuenta", running
 
+    def delete_account(self, name: str) -> tuple[bool, str]:
+        mod_file = find_module_file("codex-switch")
+        if not mod_file:
+            return False, "Ejecutable codex-switch no encontrado"
+        cmd = [sys.executable, str(mod_file), "eliminar", name]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Perfil '{name}' eliminado con éxito"
+        return False, res.stderr.strip() or res.stdout.strip() or "Error al eliminar perfil"
+
 
 class AgyProvider(BaseProvider):
     id = "agy"
@@ -368,6 +378,16 @@ class AgyProvider(BaseProvider):
         if res.returncode == 0:
             return True, f"Cuenta cambiada con éxito a '{name}'", []
         return False, res.stderr.strip() or res.stdout.strip() or "Error al cambiar cuenta", running
+
+    def delete_account(self, name: str) -> tuple[bool, str]:
+        mod_file = find_module_file("agy-switch")
+        if not mod_file:
+            return False, "Ejecutable agy-switch no encontrado"
+        cmd = [sys.executable, str(mod_file), "eliminar", name]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Perfil '{name}' eliminado con éxito"
+        return False, res.stderr.strip() or res.stdout.strip() or "Error al eliminar perfil"
 
 
 # Registro de proveedores (fácilmente extensible para futuros modelos)
@@ -1054,6 +1074,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       color: #ffffff;
     }
 
+    .btn-icon.btn-danger:hover {
+      background: rgba(239, 68, 68, 0.2);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: #f87171;
+    }
+
     /* Estado Vacío */
     .empty-state {
       grid-column: 1 / -1;
@@ -1540,6 +1566,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
+    // Eliminar perfil guardado
+    async function requestDelete(provider, account) {
+      if (!confirm(`¿Estás seguro de que deseas eliminar el perfil guardado "${account}"?`)) return;
+      try {
+        const resp = await fetch("/api/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider, account }),
+        });
+        const data = await resp.json();
+        if (data.status === "ok") {
+          showToast(`🗑️ ${data.message}`, "success");
+          await fetchStatus(false);
+        } else {
+          showToast(data.message || "Error al eliminar perfil", "error");
+        }
+      } catch (err) {
+        showToast("Error de conexión al eliminar perfil", "error");
+      }
+    }
+
     // Renderizar métricas globales
     function updateMetrics() {
       let total = 0;
@@ -1775,6 +1822,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                   <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                 </svg>
               </button>
+              <button class="btn-icon btn-danger" title="Eliminar perfil '${acc.name}'" onclick="requestDelete('${acc.provider}', '${acc.name}')">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="3 6 5 6 21 6"></polyline>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg>
+              </button>
             </div>
           </div>
         `;
@@ -1965,6 +2018,33 @@ class WidgetHTTPHandler(BaseHTTPRequestHandler):
                 })
                 return
 
+            if ok:
+                self.send_json(200, {"status": "ok", "message": msg})
+            else:
+                self.send_json(400, {"status": "error", "message": msg})
+            return
+
+        if path == "/api/delete":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception:
+                self.send_json(400, {"status": "error", "message": "JSON inválido"})
+                return
+
+            prov_id = body.get("provider", "")
+            account = body.get("account", "")
+
+            provider = PROVIDERS.get(prov_id)
+            if not provider:
+                self.send_json(404, {"status": "error", "message": f"Proveedor '{prov_id}' desconocido"})
+                return
+
+            if not account:
+                self.send_json(400, {"status": "error", "message": "Nombre de cuenta requerido"})
+                return
+
+            ok, msg = provider.delete_account(account)
             if ok:
                 self.send_json(200, {"status": "ok", "message": msg})
             else:

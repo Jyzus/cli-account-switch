@@ -123,25 +123,29 @@ codex-switch tray                # o: switch-tray (bajo consumo)
 codex-switch widget              # o: switch-widget (dashboard flotante)
 
 # Gestión de cuentas:
-codex-switch guardar personal
-codex-switch nueva trabajo
-codex-switch listar              # listado rápido en disco (offline)
-codex-switch usar personal
-codex-switch continuar
+codex-switch guardar personal        # guarda las credenciales activas (evita duplicados automáticos)
+codex-switch eliminar antigua        # elimina un perfil guardado (alias: borrar, rm, quitar)
+codex-switch renombrar viejo nuevo   # renombra un alias existente (alias: mv, rename)
+codex-switch nueva trabajo           # inicia sesión interactiva para otra cuenta
+codex-switch listar                  # listado rápido en disco (offline)
+codex-switch usar personal           # cambia de cuenta y reinicia daemon
+codex-switch continuar               # reanuda última tarea
 
 # Lo mismo para Antigravity CLI:
 agy-switch status                # o: agy-switch tokens
 agy-switch status personal
 agy-switch tray                  # widget de barra de tareas
 agy-switch widget                # abre el dashboard gráfico flotante
-agy-switch guardar personal
+agy-switch guardar personal      # guarda las credenciales activas
+agy-switch eliminar antigua      # elimina un perfil guardado (alias: borrar, rm, quitar)
+agy-switch renombrar viejo nuevo # renombra un alias existente (alias: mv, rename)
 agy-switch nueva trabajo
 agy-switch listar
 agy-switch usar personal
 agy-switch continuar
 ```
 
-También se aceptan `save`, `new`, `list`, `use`, `resume`, `cuota`, `quota` y `usage`. Ejecutar el comando sin argumentos (`codex-switch` o `agy-switch`) consulta el estado en vivo de todas las cuentas. `id` muestra el identificador de la última conversación detectada; `continuar <id>` permite elegir una explícitamente.
+También se aceptan `save`, `rm`, `borrar`, `quitar`, `delete`, `mv`, `rename`, `new`, `list`, `use`, `resume`, `cuota`, `quota` y `usage`. Ejecutar el comando sin argumentos (`codex-switch` o `agy-switch`) consulta el estado en vivo de todas las cuentas. `id` muestra el identificador de la última conversación detectada; `continuar <id>` permite elegir una explícitamente.
 
 Los alias admiten de 1 a 64 caracteres: letras ASCII, números, puntos, guiones y guiones bajos; deben comenzar por letra o número.
 
@@ -158,6 +162,8 @@ El comando `status` (o `tokens`, `cuota`, `usage`) consulta en tiempo real y en 
 - Codex: usa `$CODEX_HOME` o `~/.codex`. Los perfiles se guardan en `cuentas/*.json`.
 - Antigravity: usa `~/.gemini/antigravity-cli`. Los perfiles se guardan en `cuentas/*.token`.
 - **Compatibilidad con GNOME Keyring en Linux**: Antigravity CLI en entornos de escritorio Linux almacena por defecto sus credenciales en el Secret Service del sistema (GNOME Keyring / libsecret). `agy-switch` detecta y sincroniza automáticamente las credenciales entre el Keyring del sistema y el archivo de tokens local (`~/.gemini/antigravity-cli/antigravity-oauth-token`), permitiendo guardar, consultar y alternar perfiles sin discrepancias tanto en entornos gráficos de escritorio como en servidores headless.
+- **Protección contra perfiles duplicados y sobrescrituras**: Al ejecutar `guardar <alias>`, el sistema verifica automáticamente si la cuenta activa ya se encuentra guardada bajo otro perfil. Si ya existe, bloquea la duplicación innecesaria y sugiere renombrarlo con `renombrar` o forzarlo con `--force`. Asimismo, si el alias ya pertenece a otra cuenta diferente, previene la sobrescritura accidental a menos que se indique `--force`.
+- **Eliminación y renombrado ágil**: Puedes depurar cuentas guardadas con `eliminar <alias>` (o `borrar`, `rm`, `quitar`, así como desde el botón 🗑 del widget de escritorio) y renombrar perfiles con `renombrar <actual> <nuevo>` (o `mv`, `rename`) sin perder configuraciones ni tokens.
 - Los perfiles contienen credenciales en texto claro y se escriben con permisos `600`, dentro de un directorio con permisos `700`. No los subas a Git ni los compartas.
 - Cada equipo mantiene sus propias cuentas y conversaciones. El instalador distribuye únicamente los scripts; no sincroniza datos.
 - Cambiar de perfil conserva los archivos de historial, pero la posibilidad de reanudar depende de la CLI y de los permisos de la cuenta.
