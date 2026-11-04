@@ -79,10 +79,16 @@ Diseñado específicamente para **mantenerse siempre activo con el mínimo consu
 ```bash
 # Iniciar el widget en la barra de tareas:
 switch-tray
+# O mediante el comando unificado:
+switch tray
 
-# O lanzarlo directamente desde cualquiera de las CLIs:
-codex-switch tray
-agy-switch tray
+# Anclar para que inicie automáticamente al encender la computadora:
+switch-tray --autostart enable
+# O:
+switch tray --autostart enable
+
+# Comprobar el estado del auto-inicio:
+switch-tray --autostart status
 ```
 
 ### Características del Widget de Barra de Tareas:
@@ -112,6 +118,38 @@ switch-tray -i 600                   # Cambiar intervalo de sondeo a 10 minutos 
 ```
 
 ## Uso por Terminal (CLI)
+
+### 1. Comando Unificado (`switch`)
+
+Puedes usar `switch` como comando central para interactuar con toda la suite y actualizar herramientas:
+
+```bash
+# Iniciar o configurar widget de barra de tareas:
+switch tray                       # Inicia el widget en la barra de tareas
+switch tray --autostart enable    # Ancla el widget para que inicie siempre con tu computadora
+switch tray --autostart status    # Consulta si el auto-inicio está habilitado
+
+# Monitor flotante y consulta rápida:
+switch widget                     # Abre el dashboard flotante de escritorio
+switch status                     # Consulta en vivo cuotas y tokens de Codex y AGY
+switch listar                     # Lista todas las cuentas guardadas de Codex y AGY (offline)
+switch usar <nombre>              # Cambia de cuenta (detecta automáticamente si es Codex o AGY)
+
+# Versionado y actualización de todo el sistema:
+switch version                    # Muestra las versiones de Switch, OpenAI Codex y Antigravity CLI
+switch actualizar                 # Actualiza Switch Suite, OpenAI Codex CLI y Antigravity CLI
+switch actualizar --switch        # Actualiza solo la suite de Switch
+switch actualizar --codex         # Actualiza solo OpenAI Codex CLI
+switch actualizar --agy           # Actualiza solo Antigravity CLI
+
+# Comandos directos delegados por herramienta:
+switch codex status               # Estado de Codex
+switch codex agregar secundaria --device-auth # Agrega cuenta a Codex
+switch agy status                 # Estado de AGY
+switch agy agregar trabajo        # Agrega cuenta a AGY
+```
+
+### 2. Comandos específicos por CLI (`codex-switch` y `agy-switch`)
 
 ```bash
 # Consultar cuota, tokens restantes y tiempo de reseteo en vivo:
@@ -188,6 +226,7 @@ Estos scripts dependen de rutas y formatos internos de las CLI, que pueden cambi
 
 Puedes consultar la versión instalada de cada componente en cualquier momento con:
 ```bash
+switch version            # Muestra versiones de Switch, Codex y AGY
 codex-switch version      # o: codex-switch --version / -v
 agy-switch version        # o: agy-switch --version / -v
 switch-widget --version
@@ -196,11 +235,16 @@ switch-tray --version
 
 ### Actualización a la última versión:
 
-**Opción 1: Comando directo desde la CLI (Recomendado)**
+**Opción 1: Actualización completa con un solo comando (Recomendado)**
 ```bash
-codex-switch actualizar   # o: agy-switch actualizar (alias: update, upgrade)
+switch actualizar
 ```
-*Detecta automáticamente si estás en un repositorio local o si instalaste vía remota, descargando y actualizando todos los binarios de la suite de inmediato.*
+*Actualiza de forma inteligente:*
+1. **CLI Account Switch** (`switch`, `codex-switch`, `agy-switch`, `switch-widget`, `switch-tray`) a la última versión de GitHub.
+2. **OpenAI Codex CLI** mediante `codex update`.
+3. **Google Antigravity CLI** mediante `agy update`.
+
+*También puedes actualizar componentes individualmente con `switch actualizar --switch`, `switch actualizar --codex`, o `switch actualizar --agy`, así como con `codex-switch actualizar` y `agy-switch actualizar`.*
 
 **Opción 2: Reinstalación/actualización remota en una sola línea (curl | bash)**
 ```bash
@@ -213,7 +257,7 @@ git pull --ff-only
 ./install.sh
 ```
 
-Para desinstalar, elimina `codex-switch`, `agy-switch`, `switch-widget` y `switch-tray` del directorio de instalación (`~/.local/bin`). Tus perfiles e historiales permanecen en sus directorios de configuración.
+Para desinstalar, elimina `switch`, `codex-switch`, `agy-switch`, `switch-widget` y `switch-tray` del directorio de instalación (`~/.local/bin`). Tus perfiles e historiales permanecen en sus directorios de configuración.
 
 ## Contribuciones
 

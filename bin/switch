@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+switch: CLI unificada para gestión de multi-cuentas, widgets y actualización
+de OpenAI Codex y Google Antigravity (AGY).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import shutil
+import subprocess
+import tempfile
+import urllib.request
+from pathlib import Path
+
+VERSION = "1.1.0"
+GITHUB_REPO = "Jyzus/cli-account-switch"
+INSTALL_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
+
+
+def find_tool(name: str) -> Path | None:
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / name,
+        Path.home() / ".local" / "bin" / name,
+        Path("/usr/local/bin") / name,
+    ]
+    which = shutil.which(name)
+    if which:
+        candidates.insert(0, Path(which))
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def exec_subcommand(tool_name: str, args: list[str]):
+    t = find_tool(tool_name)
+    if not t:
+        print(f"❌ Error: No se encontró el ejecutable '{tool_name}'.")
+        print("   Ejecuta ./install.sh para instalar la suite completa.")
+        sys.exit(1)
+    cmd = [sys.executable, str(t)] + args
+    try:
+        res = subprocess.run(cmd)
+        sys.exit(res.returncode)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def cmd_version():
+    codex_ver = "No instalado"
+    codex_path = shutil.which("codex")
+    if codex_path:
+        try:
+            r = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                codex_ver = r.stdout.strip()
+            else:
+                codex_ver = "Instalado"
+        except Exception:
+            codex_ver = "Instalado"
+
+    agy_ver = "No instalado"
+    agy_path = shutil.which("agy")
+    if agy_path:
+        try:
+            r = subprocess.run(["agy", "--version"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                agy_ver = r.stdout.strip()
+            else:
+                agy_ver = "Instalado"
+        except Exception:
+            agy_ver = "Instalado"
+
+    print(f"\n╭─────────────────────────────────────────────────────────────╮")
+    print(f"│  ✦ CLI Account Switch v{VERSION:<36}│")
+    print(f"╰─────────────────────────────────────────────────────────────╯")
+    print(f"  • Suite Switch : \033[1;32mv{VERSION}\033[0m")
+    print(f"  • OpenAI Codex : \033[1;36m{codex_ver}\033[0m")
+    print(f"  • Google AGY   : \033[1;35m{agy_ver}\033[0m")
+    print(f"  • Repositorio  : https://github.com/{GITHUB_REPO}\n")
+    print(f"  🔄 Para actualizar Switch, Codex y AGY:")
+    print(f"     \033[1;33mswitch actualizar\033[0m\n")
+    print(f"  💡 Comando para reinstalar / actualizar remotamente:")
+    print(f"     \033[1mcurl -fsSL {INSTALL_URL} | bash\033[0m\n")
+
+
+def cmd_actualizar(args: list[str]):
+    update_switch = True
+    update_codex = True
+    update_agy = True
+
+    if "--switch" in args or "--switch-only" in args:
+        update_codex = False
+        update_agy = False
+    elif "--codex" in args and "--agy" not in args:
+        update_switch = False
+        update_agy = False
+    elif "--agy" in args and "--codex" not in args:
+        update_switch = False
+        update_codex = False
+
+    print("\n╭─────────────────────────────────────────────────────────────╮")
+    print("│  🔄 ACTUALIZACIÓN COMPLETA (SWITCH · CODEX · AGY)           │")
+    print("╰─────────────────────────────────────────────────────────────╯")
+    print(f"  • Suite Switch actual : \033[1;36mv{VERSION}\033[0m")
+    print(f"  • Repositorio oficial : https://github.com/{GITHUB_REPO}\n")
+
+    # 1. Actualizar Switch Suite
+    if update_switch:
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("  [1/3] Actualizando CLI Account Switch...")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        here = Path(__file__).resolve().parent
+        repo_dir = here.parent if (here.parent / ".git").is_dir() else None
+
+        updated_local = False
+        if repo_dir and shutil.which("git"):
+            print(f"  📁 Repositorio git local detectado en: {repo_dir}")
+            print("     Sincronizando cambios con 'git pull'...")
+            try:
+                res_pull = subprocess.run(["git", "-C", str(repo_dir), "pull", "--ff-only"], check=False, capture_output=True, text=True)
+                if res_pull.returncode == 0:
+                    if res_pull.stdout.strip():
+                        print(f"     {res_pull.stdout.strip()}")
+                    install_script = repo_dir / "install.sh"
+                    if install_script.is_file():
+                        print("     Reinstalando scripts en el sistema...")
+                        res_inst = subprocess.run(["bash", str(install_script)], check=False)
+                        if res_inst.returncode == 0:
+                            updated_local = True
+                else:
+                    print(f"     ⚠️ 'git pull' no pudo completarse limpiamente: {res_pull.stderr.strip()}")
+                    print("     Intentando actualización directa...")
+            except Exception as e:
+                print(f"     ⚠️ Error con git pull: {e}")
+
+        if not updated_local:
+            print("  🌐 Descargando instalador oficial desde GitHub...")
+            try:
+                req = urllib.request.Request(INSTALL_URL, headers={"User-Agent": "switch-updater"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    script_content = resp.read().decode("utf-8")
+                with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+                    f.write(script_content)
+                    installer_path = f.name
+                try:
+                    os.chmod(installer_path, 0o755)
+                    res = subprocess.run(["bash", installer_path], check=False)
+                    if res.returncode == 0:
+                        print("  ✅ CLI Account Switch actualizado con éxito.")
+                    else:
+                        print(f"  ⚠️ El instalador finalizó con código {res.returncode}")
+                finally:
+                    if os.path.exists(installer_path):
+                        os.unlink(installer_path)
+            except Exception as e:
+                print(f"  ⚠️ No se pudo descargar el instalador remoto: {e}")
+        else:
+            print("  ✅ CLI Account Switch actualizado con éxito.")
+
+    # 2. Actualizar Codex CLI
+    if update_codex:
+        print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("  [2/3] Verificando y actualizando OpenAI Codex CLI...")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        if shutil.which("codex"):
+            try:
+                res_codex = subprocess.run(["codex", "update"], check=False)
+                if res_codex.returncode == 0:
+                    print("  ✅ Codex CLI actualizado correctamente.")
+                else:
+                    print(f"  ℹ️ 'codex update' finalizó con código {res_codex.returncode}")
+            except Exception as e:
+                print(f"  ⚠️ Error al ejecutar 'codex update': {e}")
+        else:
+            print("  ℹ️ 'codex' no está instalado en este sistema.")
+
+    # 3. Actualizar Antigravity CLI (agy)
+    if update_agy:
+        print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("  [3/3] Verificando y actualizando Antigravity CLI (agy)...")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        if shutil.which("agy"):
+            try:
+                res_agy = subprocess.run(["agy", "update"], check=False)
+                if res_agy.returncode == 0:
+                    print("  ✅ Antigravity CLI (agy) actualizado correctamente.")
+                else:
+                    print(f"  ℹ️ 'agy update' finalizó con código {res_agy.returncode}")
+            except Exception as e:
+                print(f"  ⚠️ Error al ejecutar 'agy update': {e}")
+        else:
+            print("  ℹ️ 'agy' no está instalado en este sistema.")
+
+    print("\n🎉 ¡Proceso de actualización finalizado!")
+    print("   Usa \033[1;32mswitch version\033[0m para verificar el estado de todas las herramientas.\n")
+
+
+def cmd_status(target: str = ""):
+    codex_tool = find_tool("codex-switch")
+    agy_tool = find_tool("agy-switch")
+
+    if codex_tool:
+        print("\n===============================================================")
+        print("  OPENAI CODEX CLI · CUOTAS Y TOKENS")
+        print("===============================================================")
+        subprocess.run([sys.executable, str(codex_tool), "status"] + ([target] if target else []))
+
+    if agy_tool:
+        print("\n===============================================================")
+        print("  GOOGLE ANTIGRAVITY (AGY) · CUOTAS Y TOKENS")
+        print("===============================================================")
+        subprocess.run([sys.executable, str(agy_tool), "status"] + ([target] if target else []))
+
+
+def cmd_listar():
+    codex_tool = find_tool("codex-switch")
+    agy_tool = find_tool("agy-switch")
+
+    if codex_tool:
+        print("\n--- Perfiles de OpenAI Codex ---")
+        subprocess.run([sys.executable, str(codex_tool), "listar"])
+
+    if agy_tool:
+        print("\n--- Perfiles de Google Antigravity ---")
+        subprocess.run([sys.executable, str(agy_tool), "listar"])
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
+        target = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        cmd_status(target)
+    elif args[0] in ("tray", "barra", "taskbar"):
+        exec_subcommand("switch-tray", args[1:])
+    elif args[0] in ("widget", "gui", "ui", "dashboard"):
+        exec_subcommand("switch-widget", args[1:])
+    elif args[0] in ("version", "--version", "-v", "-V"):
+        cmd_version()
+    elif args[0] in ("actualizar", "update", "upgrade"):
+        cmd_actualizar(args[1:])
+    elif args[0] in ("codex", "openai"):
+        exec_subcommand("codex-switch", args[1:])
+    elif args[0] in ("agy", "antigravity", "gemini"):
+        exec_subcommand("agy-switch", args[1:])
+    elif args[0] in ("listar", "list", "ls"):
+        cmd_listar()
+    elif args[0] in ("agregar", "add"):
+        # Si se especifica proveedor: switch agregar codex <nombre> o switch agregar agy <nombre>
+        if len(args) > 1 and args[1] in ("codex", "openai"):
+            exec_subcommand("codex-switch", ["agregar"] + args[2:])
+        elif len(args) > 1 and args[1] in ("agy", "antigravity"):
+            exec_subcommand("agy-switch", ["agregar"] + args[2:])
+        else:
+            print("Uso para agregar cuenta:")
+            print("  switch codex agregar <nombre> [--device-auth] [--desde <archivo>]")
+            print("  switch agy agregar <nombre> [--desde <archivo>]")
+            print("\nO usa directamente:")
+            print("  codex-switch agregar <nombre>")
+            print("  agy-switch agregar <nombre>")
+            sys.exit(1)
+    elif args[0] in ("guardar", "save"):
+        if len(args) > 1 and args[1] in ("codex", "openai"):
+            exec_subcommand("codex-switch", ["guardar"] + args[2:])
+        elif len(args) > 1 and args[1] in ("agy", "antigravity"):
+            exec_subcommand("agy-switch", ["guardar"] + args[2:])
+        else:
+            print("Uso: switch codex guardar <nombre>  o  switch agy guardar <nombre>")
+            sys.exit(1)
+    elif args[0] in ("usar", "use"):
+        # Buscar en cuál herramienta existe el perfil
+        alias = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        if not alias:
+            print("Uso: switch usar <nombre>  (o: switch codex usar <nombre> / switch agy usar <nombre>)")
+            sys.exit(1)
+        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        agy_home = Path.home() / ".gemini" / "antigravity-cli"
+
+        in_codex = (codex_home / "cuentas" / f"{alias}.json").is_file()
+        in_agy = (agy_home / "cuentas" / f"{alias}.token").is_file()
+
+        if in_codex and not in_agy:
+            exec_subcommand("codex-switch", ["usar"] + args[1:])
+        elif in_agy and not in_codex:
+            exec_subcommand("agy-switch", ["usar"] + args[1:])
+        elif in_codex and in_agy:
+            print(f"El perfil '{alias}' existe tanto en Codex como en AGY.")
+            print(f"Especifica la herramienta con: switch codex usar {alias}  o  switch agy usar {alias}")
+            sys.exit(1)
+        else:
+            print(f"❌ Error: El perfil '{alias}' no existe en cuentas de Codex ni de AGY.")
+            print("Usa: switch listar")
+            sys.exit(1)
+    elif args[0] in ("eliminar", "borrar", "rm"):
+        if len(args) > 1 and args[1] in ("codex", "openai"):
+            exec_subcommand("codex-switch", ["eliminar"] + args[2:])
+        elif len(args) > 1 and args[1] in ("agy", "antigravity"):
+            exec_subcommand("agy-switch", ["eliminar"] + args[2:])
+        else:
+            print("Uso: switch codex eliminar <nombre>  o  switch agy eliminar <nombre>")
+            sys.exit(1)
+    elif args[0] in ("renombrar", "mv"):
+        if len(args) > 1 and args[1] in ("codex", "openai"):
+            exec_subcommand("codex-switch", ["renombrar"] + args[2:])
+        elif len(args) > 1 and args[1] in ("agy", "antigravity"):
+            exec_subcommand("agy-switch", ["renombrar"] + args[2:])
+        else:
+            print("Uso: switch codex renombrar <actual> <nuevo>  o  switch agy renombrar <actual> <nuevo>")
+            sys.exit(1)
+    elif args[0] in ("ayuda", "help", "--help", "-h"):
+        print("Uso: switch [comando] [argumentos]")
+        print("\nComandos unificados de la suite:")
+        print("  tray                        Inicia el widget en la barra de tareas / system tray")
+        print("  tray --autostart enable     Ancla el widget para que inicie automáticamente con el PC")
+        print("  widget                      Abre el monitor gráfico de escritorio (dashboard)")
+        print("  status [nombre]             Consulta cuotas y tokens en vivo de Codex y AGY")
+        print("  listar                      Lista todas las cuentas guardadas de Codex y AGY (offline)")
+        print("  usar <nombre>               Cambia a la cuenta indicada (detecta Codex o AGY)")
+        print("  actualizar                  Actualiza la suite Switch, OpenAI Codex y Antigravity CLI")
+        print("                              (opciones: --switch, --codex, --agy)")
+        print("  version                     Muestra las versiones instaladas de Switch, Codex y AGY")
+        print("\nComandos por herramienta:")
+        print("  switch codex [subcomando]   Ejecuta comandos de codex-switch (status, usar, agregar, etc.)")
+        print("  switch agy [subcomando]     Ejecuta comandos de agy-switch (status, usar, agregar, etc.)")
+        print("\nEjemplos:")
+        print("  switch tray --autostart enable")
+        print("  switch actualizar")
+        print("  switch codex agregar secundaria --device-auth")
+        print("  switch agy agregar trabajo")
+        print("  switch status")
+    else:
+        print(f"Comando desconocido: {args[0]}")
+        print("Uso: switch [tray | widget | status | listar | usar <nombre> | actualizar | version | codex | agy | ayuda]")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

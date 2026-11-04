@@ -1358,6 +1358,16 @@ def cmd_actualizar(extra_args: list = None):
         if os.path.exists(installer_path):
             os.unlink(installer_path)
 
+    # Actualizar también el cliente Antigravity CLI
+    if shutil.which("agy") and "--no-agy" not in (extra_args or []):
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("  Verificando y actualizando Antigravity CLI ('agy update')...")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        try:
+            subprocess.run(["agy", "update"], check=False)
+        except Exception as e:
+            print(f"  ⚠️ No se pudo ejecutar 'agy update': {e}")
+
 
 def main():
     args = sys.argv[1:]

@@ -1151,6 +1151,16 @@ def cmd_actualizar(extra_args: list = None):
         if os.path.exists(installer_path):
             os.unlink(installer_path)
 
+    # Actualizar también el cliente OpenAI Codex CLI
+    if shutil.which("codex") and "--no-codex" not in (extra_args or []):
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("  Verificando y actualizando OpenAI Codex CLI ('codex update')...")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        try:
+            subprocess.run(["codex", "update"], check=False)
+        except Exception as e:
+            print(f"  ⚠️ No se pudo ejecutar 'codex update': {e}")
+
 
 def main():
     args = sys.argv[1:]
