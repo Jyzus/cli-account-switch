@@ -21,6 +21,10 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+VERSION = "1.1.0"
+GITHUB_REPO = "Jyzus/cli-account-switch"
+INSTALL_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
+
 def validate_alias(nombre: str):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", nombre):
         print("❌ Alias inválido: usa de 1 a 64 letras, números, puntos, guiones o guiones bajos; empieza con letra o número.")
@@ -395,6 +399,8 @@ def cmd_status(target: str = ""):
     print("    codex-switch nueva <nombre>     Inicia sesión con una cuenta adicional")
     print("    codex-switch eliminar <nombre>  Elimina un perfil guardado (alias: borrar, rm)")
     print("    codex-switch renombrar <a1> <a2> Renombra un perfil guardado (alias: mv)")
+    print("    codex-switch version            Muestra la versión instalada y opciones de actualización")
+    print("    codex-switch actualizar         Actualiza CLI Account Switch a la última versión (alias: update)")
     print("    codex-switch continuar          Reanuda la última tarea\n")
 
 def cmd_guardar(nombre: str, force: bool = False):
@@ -1071,11 +1077,90 @@ def cmd_tray(extra_args: list):
         pass
 
 
+def cmd_version():
+    print(f"\n╭─────────────────────────────────────────────────────────────╮")
+    print(f"│  ✦ CLI Account Switch v{VERSION:<36}│")
+    print(f"╰─────────────────────────────────────────────────────────────╯")
+    print(f"  • Herramienta : \033[1;36mcodex-switch\033[0m")
+    print(f"  • Suite       : CLI Account Switch (Codex & AGY Multi-Account)")
+    print(f"  • Versión     : \033[1;32mv{VERSION}\033[0m")
+    print(f"  • Repositorio : https://github.com/{GITHUB_REPO}\n")
+    print(f"  🔄 Para actualizar a la última versión disponible desde GitHub:")
+    print(f"     \033[1;33mcodex-switch actualizar\033[0m\n")
+    print(f"  💡 O ejecuta directamente el instalador oficial:")
+    print(f"     \033[1mcurl -fsSL {INSTALL_URL} | bash\033[0m\n")
+
+
+def cmd_actualizar(extra_args: list = None):
+    print("\n╭─────────────────────────────────────────────────────────────╮")
+    print("│  🔄 ACTUALIZANDO CLI ACCOUNT SWITCH DESDE GITHUB            │")
+    print("╰─────────────────────────────────────────────────────────────╯")
+    print(f"  • Versión instalada actualmente : \033[1;36mv{VERSION}\033[0m")
+    print(f"  • Repositorio oficial           : https://github.com/{GITHUB_REPO}\n")
+
+    here = Path(__file__).resolve().parent
+    repo_dir = here.parent if (here.parent / ".git").is_dir() else None
+
+    if repo_dir and shutil.which("git"):
+        print(f"  📁 Repositorio git local detectado en: {repo_dir}")
+        print("     Sincronizando cambios con 'git pull'...")
+        try:
+            res_pull = subprocess.run(["git", "-C", str(repo_dir), "pull", "--ff-only"], check=False, capture_output=True, text=True)
+            if res_pull.returncode == 0:
+                print(f"     {res_pull.stdout.strip()}")
+                install_script = repo_dir / "install.sh"
+                if install_script.is_file():
+                    print("     Reinstalando scripts en el sistema...")
+                    res_inst = subprocess.run(["bash", str(install_script)] + (extra_args or []), check=False)
+                    if res_inst.returncode == 0:
+                        print(f"\n✅ ¡CLI Account Switch se ha actualizado exitosamente a la última versión!")
+                        return
+            else:
+                print(f"⚠️ 'git pull' no pudo completarse limpiamente: {res_pull.stderr.strip()}")
+                print("   Intentando actualización directa descargando el instalador oficial...")
+        except Exception as e:
+            print(f"⚠️ Error al actualizar mediante git: {e}")
+            print("   Intentando actualización directa...")
+
+    print(f"  🌐 Descargando instalador oficial desde GitHub...")
+    try:
+        req = urllib.request.Request(INSTALL_URL, headers={"User-Agent": "cli-account-switch-updater"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            script_content = resp.read().decode("utf-8")
+    except Exception as e:
+        print(f"❌ Error al conectar con GitHub para descargar el instalador: {e}")
+        print("\nPuedes actualizar manualmente ejecutando en tu terminal:")
+        print(f"  curl -fsSL {INSTALL_URL} | bash\n")
+        sys.exit(1)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+        f.write(script_content)
+        installer_path = f.name
+
+    try:
+        os.chmod(installer_path, 0o755)
+        cmd = ["bash", installer_path] + (extra_args or [])
+        res = subprocess.run(cmd, check=False)
+        if res.returncode == 0:
+            print(f"\n✅ ¡CLI Account Switch se ha actualizado exitosamente desde GitHub!")
+            print("   Ejecuta: \033[1;32mcodex-switch version\033[0m para verificar la versión instalada.\n")
+        else:
+            print(f"\n❌ El instalador finalizó con código de error: {res.returncode}")
+            sys.exit(res.returncode)
+    finally:
+        if os.path.exists(installer_path):
+            os.unlink(installer_path)
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
         target = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         cmd_status(target)
+    elif args[0] in ("version", "--version", "-v", "-V"):
+        cmd_version()
+    elif args[0] in ("actualizar", "update", "upgrade"):
+        cmd_actualizar(args[1:])
     elif args[0] in ("listar", "list", "ls"):
         cmd_listar()
     elif args[0] in ("guardar", "save"):
@@ -1162,9 +1247,11 @@ def main():
         print("  nueva <nombre>    Inicia sesión interactiva para registrar una nueva cuenta")
         print("  continuar         Reanuda la última conversación registrada")
         print("  id                Muestra el identificador de la última sesión")
+        print("  version           Muestra la versión instalada y comandos de actualización (alias: -v, --version)")
+        print("  actualizar        Actualiza CLI Account Switch a la última versión desde GitHub (alias: update)")
     else:
         print(f"Comando desconocido: {args[0]}")
-        print("Uso: codex-switch [tray | widget | status [nombre] | tokens | listar | agregar <nombre> | guardar <nombre> | eliminar <nombre> | renombrar <a1> <a2> | usar <nombre> | nueva <nombre> | continuar | id]")
+        print("Uso: codex-switch [tray | widget | status [nombre] | tokens | listar | agregar <nombre> | guardar <nombre> | eliminar <nombre> | renombrar <a1> <a2> | usar <nombre> | nueva <nombre> | continuar | version | actualizar | id]")
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+VERSION = "1.1.0"
+
 # ==============================================================================
 # CARGA DE MÓDULOS DE CODEX Y AGY
 # ==============================================================================
@@ -634,6 +636,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="CLI Account Switch · Taskbar Widget (Monitor de tokens en barra de tareas con bajo consumo)"
     )
+    parser.add_argument("-v", "--version", action="version", version=f"CLI Account Switch Taskbar Widget v{VERSION}")
     parser.add_argument("-i", "--interval", type=int, default=300, help="Intervalo de consulta en segundos (por defecto 300s = 5 min)")
     parser.add_argument("--autostart", choices=["enable", "disable", "status"], help="Gestionar auto-inicio al encender la computadora")
     parser.add_argument("--status", action="store_true", help="Consultar estado rápido en la terminal y salir")

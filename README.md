@@ -125,6 +125,7 @@ codex-switch widget              # o: switch-widget (dashboard flotante)
 # Gestión de cuentas:
 codex-switch agregar trabajo         # agrega una cuenta en entorno aislado SIN cerrar tus chats activos
 codex-switch agregar trabajo --desde creds.json # importa credenciales directamente sin abrir navegador
+codex-switch agregar trabajo --device-auth     # agrega mediante código de dispositivo (sin navegador local)
 codex-switch guardar personal        # guarda las credenciales activas (evita duplicados automáticos)
 codex-switch eliminar antigua        # elimina un perfil guardado (alias: borrar, rm, quitar)
 codex-switch renombrar viejo nuevo   # renombra un alias existente (alias: mv, rename)
@@ -132,6 +133,8 @@ codex-switch nueva trabajo           # inicia sesión interactiva para otra cuen
 codex-switch listar                  # listado rápido en disco (offline)
 codex-switch usar personal           # cambia de cuenta y reinicia daemon
 codex-switch continuar               # reanuda última tarea
+codex-switch version                 # consulta versión instalada (alias: --version, -v)
+codex-switch actualizar              # actualiza la suite a la última versión (alias: update)
 
 # Lo mismo para Antigravity CLI:
 agy-switch status                # o: agy-switch tokens
@@ -147,6 +150,8 @@ agy-switch nueva trabajo
 agy-switch listar
 agy-switch usar personal
 agy-switch continuar
+agy-switch version               # consulta versión instalada (alias: --version, -v)
+agy-switch actualizar            # actualiza la suite a la última versión (alias: update)
 ```
 
 También se aceptan `save`, `rm`, `borrar`, `quitar`, `delete`, `mv`, `rename`, `new`, `list`, `use`, `resume`, `cuota`, `quota` y `usage`. Ejecutar el comando sin argumentos (`codex-switch` o `agy-switch`) consulta el estado en vivo de todas las cuentas. `id` muestra el identificador de la última conversación detectada; `continuar <id>` permite elegir una explícitamente.
@@ -179,14 +184,36 @@ El comando `status` (o `tokens`, `cuota`, `usage`) consulta en tiempo real y en 
 
 Estos scripts dependen de rutas y formatos internos de las CLI, que pueden cambiar. Evita ejecutar cambios de cuenta simultáneamente en el mismo directorio de configuración.
 
-## Actualización y desinstalación
+## Versión y Actualización desde GitHub
 
+Puedes consultar la versión instalada de cada componente en cualquier momento con:
+```bash
+codex-switch version      # o: codex-switch --version / -v
+agy-switch version        # o: agy-switch --version / -v
+switch-widget --version
+switch-tray --version
+```
+
+### Actualización a la última versión:
+
+**Opción 1: Comando directo desde la CLI (Recomendado)**
+```bash
+codex-switch actualizar   # o: agy-switch actualizar (alias: update, upgrade)
+```
+*Detecta automáticamente si estás en un repositorio local o si instalaste vía remota, descargando y actualizando todos los binarios de la suite de inmediato.*
+
+**Opción 2: Reinstalación/actualización remota en una sola línea (curl | bash)**
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jyzus/cli-account-switch/main/install.sh | bash
+```
+
+**Opción 3: Si trabajas desde el repositorio clonado**
 ```bash
 git pull --ff-only
 ./install.sh
 ```
 
-Para desinstalar, elimina `codex-switch` y `agy-switch` del directorio de instalación. Tus perfiles e historiales permanecen en sus directorios de configuración.
+Para desinstalar, elimina `codex-switch`, `agy-switch`, `switch-widget` y `switch-tray` del directorio de instalación (`~/.local/bin`). Tus perfiles e historiales permanecen en sus directorios de configuración.
 
 ## Contribuciones
 

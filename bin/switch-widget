@@ -23,6 +23,8 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+VERSION = "1.1.0"
+
 # ==============================================================================
 # CARGA DE MÓDULOS DE CODEX Y AGY
 # ==============================================================================
@@ -2131,6 +2133,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="CLI Account Switch · Desktop Widget (Monitor de Cuotas, Tokens y Consumo Semanal)"
     )
+    parser.add_argument("-v", "--version", action="version", version=f"CLI Account Switch Desktop Widget v{VERSION}")
     parser.add_argument("-p", "--port", type=int, default=4920, help="Puerto local del servidor (por defecto 4920)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host al que vincular el servidor (por defecto 127.0.0.1)")
     parser.add_argument("-f", "--filter", type=str, choices=["all", "codex", "agy"], default="all", help="Filtro predeterminado")
