@@ -135,6 +135,16 @@ switch status                     # Consulta en vivo cuotas y tokens de Codex y 
 switch listar                     # Lista todas las cuentas guardadas de Codex y AGY (offline)
 switch usar <nombre>              # Cambia de cuenta (detecta automáticamente si es Codex o AGY)
 
+# Ejecución paralela concurrente (sin tocar tu cuenta activa):
+switch paralelo agy cuenta2 -- agy -p "Analiza esta función"
+switch paralelo codex secundaria -- codex exec "Corre las pruebas"
+
+# Contrato no interactivo JSON para orquestadores y scripts:
+switch cuentas --json             # Lista cuentas en JSON con emails enmascarados y sin secretos
+switch cuota --json               # Telemetría de consumo en vivo de sólo lectura (sin mutaciones)
+switch ocupacion --json           # Reporte de procesos activos y estado de bloqueo
+switch seleccionar codex secundaria --dry-run --json # Simula selección atómica segura
+
 # Versionado y actualización de todo el sistema:
 switch version                    # Muestra las versiones de Switch, OpenAI Codex y Antigravity CLI
 switch actualizar                 # Actualiza Switch Suite, OpenAI Codex CLI y Antigravity CLI
@@ -170,6 +180,7 @@ codex-switch renombrar viejo nuevo   # renombra un alias existente (alias: mv, r
 codex-switch nueva trabajo           # inicia sesión interactiva para otra cuenta
 codex-switch listar                  # listado rápido en disco (offline)
 codex-switch usar personal           # cambia de cuenta y reinicia daemon
+codex-switch paralelo secundaria -- codex exec "tarea" # ejecución paralela aislada (sin tocar cuenta activa)
 codex-switch continuar               # reanuda última tarea
 codex-switch version                 # consulta versión instalada (alias: --version, -v)
 codex-switch actualizar              # actualiza la suite a la última versión (alias: update)
@@ -187,6 +198,7 @@ agy-switch renombrar viejo nuevo # renombra un alias existente (alias: mv, renam
 agy-switch nueva trabajo
 agy-switch listar
 agy-switch usar personal
+agy-switch paralelo cuenta2 -- agy -p "tarea" # ejecución paralela aislada (sin tocar cuenta activa)
 agy-switch continuar
 agy-switch version               # consulta versión instalada (alias: --version, -v)
 agy-switch actualizar            # actualiza la suite a la última versión (alias: update)
@@ -203,6 +215,65 @@ El comando `status` (o `tokens`, `cuota`, `usage`) consulta en tiempo real y en 
 - **Antigravity CLI**: Muestra la cuota restante de modelos Gemini y de terceros (Claude / GPT), tiempo de refresco y plan/tier activo.
 - **Auto-refresco inteligente**: Si un token de acceso OAuth expiró pero posee un refresh token válido, se refresca y actualiza automáticamente en disco sin requerir re-login manual.
 - **Detección de cuentas listas**: Resalta qué perfiles tienen tokens disponibles para que sepas a cuál cambiar al instante.
+
+## Ejecución Concurrente Multi-Cuenta en Paralelo (`paralelo`)
+
+A partir de la versión **v1.2.0**, Switch permite trabajar con **dos o más cuentas a la par en el mismo equipo** sin necesidad de alternar la cuenta principal ni cerrar sesiones activas:
+
+```bash
+# Ejecutar un comando puntual en Antigravity con una cuenta secundaria:
+switch paralelo agy cuenta2 -- agy -p "Analiza el rendimiento del módulo auth"
+
+# O mediante agy-switch directamente:
+agy-switch paralelo cuenta2 -- agy -p "Genera pruebas de carga"
+
+# Ejecutar un comando puntual en Codex con una cuenta secundaria:
+switch paralelo codex secundaria -- codex exec "Revisa la cobertura de código"
+
+# Abrir una subshell o sesión interactiva completa con la cuenta secundaria:
+agy-switch paralelo cuenta2
+codex-switch paralelo secundaria
+```
+
+### Arquitectura de Seguridad del Modo Paralelo:
+- **Profile-Scoped Runtime Sandboxing**: Cada subproceso paralelo opera en su propio directorio de ejecución (`~/.gemini/antigravity-cli/runtimes/<alias>/` o `~/.codex/runtimes/<alias>/`), garantizando que la memoria de conversación, logs y archivos de estado no colisionen con la cuenta activa principal.
+- **Aislamiento de Keyring (Anti-Leak)**: Desconecta `DBUS_SESSION_BUS_ADDRESS=""` para impedir que la cuenta secundaria lea o contamine el GNOME Keyring del sistema.
+- **Preservación del Entorno Global**: Enlaza automáticamente mediante symlinks los archivos de configuración del usuario real (`.gitconfig`, llaves `.ssh` y `~/.gemini/config/`), permitiendo que el proceso secundario conserve acceso a Git, SSH, skills y servidores MCP.
+- **Sincronización Segura de Refresco**: Si el subproceso secundario renueva su token OAuth durante la ejecución, este se sincroniza de vuelta atómicamente a `cuentas/<alias>.token` (o `cuentas/<alias>.json`) y **nunca** sobrescribe las credenciales de la cuenta activa en disco.
+
+## Contrato Headless y Salida JSON para Orquestadores (`--json`)
+
+Diseñado específicamente para automatizaciones, runners de código y orquestadores (como **Planifier Docs**), Switch proporciona una interfaz estructurada no interactiva y determinista:
+
+```bash
+# 1. Listado rápido offline de cuentas guardadas (con enmascaramiento de datos sensibles):
+switch cuentas --json
+
+# 2. Telemetría de cuotas en vivo de sólo lectura (sin mutaciones en disco ni reinicios):
+switch cuota --json
+switch cuota agy --json            # filtrado por proveedor
+switch cuota codex principal --json # filtrado por cuenta específica
+
+# 3. Inspección de procesos y ocupación:
+switch ocupacion --json
+
+# 4. Verificación y conmutación atómica segura:
+switch seleccionar codex secundaria --dry-run --json
+switch seleccionar codex secundaria --json
+```
+
+### Principios y Garantías del Contrato JSON:
+1. **Cero Secretos**: Los campos `access_token`, `refresh_token`, `id_token` y `OPENAI_API_KEY` son estrictamente filtrados. Los correos e identificadores se devuelven enmascarados (ej: `k***r@gmail.com`).
+2. **Lectura Segura sin Mutaciones**: Las consultas de cuota operan en modo de sólo lectura respecto a la cuenta activa en disco; jamás sobrescriben `auth.json` ni `antigravity-oauth-token` del entorno global.
+3. **Taxonomía Canónica de Errores**:
+   - `active_session`: Se detectaron clientes interactivos o daemons vinculados a la sesión actual; conmutación bloqueada para prevenir desconexiones.
+   - `invalid_auth`: Credenciales expiradas o inválidas que requieren re-autenticación humana.
+   - `network_error`: Problema de conectividad, timeout o error 5xx con la API del proveedor.
+   - `unknown_quota`: La API remota no devolvió información de saldo interpretable.
+   - `unsupported_capability`: Capacidad o proveedor no implementado (ej. OpenCode).
+   - `lock_failed`: Contienda de concurrencia al intentar adquirir el bloqueo atómico `switch.lock`.
+4. **Soporte Transparente de OpenCode**: Si se consulta `opencode`, Switch devuelve explícitamente `disponible: false` y `capacidad: "unsupported_capability"`, sin inventar saldo ni deshabilitar el runner en el planeador.
+
 
 ## Datos y comportamiento
 
