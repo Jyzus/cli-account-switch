@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 GITHUB_REPO = "Jyzus/cli-account-switch"
 INSTALL_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
 
@@ -1369,8 +1369,321 @@ def cmd_actualizar(extra_args: list = None):
             print(f"  ⚠️ No se pudo ejecutar 'agy update': {e}")
 
 
+def mask_identifier(ident: str) -> str:
+    if not ident:
+        return "Desconocido"
+    if "@" in ident:
+        parts = ident.split("@", 1)
+        user, domain = parts[0], parts[1]
+        if len(user) <= 1:
+            masked_user = user + "***"
+        elif len(user) == 2:
+            masked_user = user[0] + "***"
+        else:
+            masked_user = user[0] + "***" + user[-1]
+        return f"{masked_user}@{domain}"
+    if len(ident) > 6:
+        return ident[:2] + "***" + ident[-2:]
+    return "***"
+
+
+def acquire_file_lock(lock_file: Path, timeout: float = 3.0):
+    try:
+        import fcntl
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+        start = time.time()
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except (BlockingIOError, OSError):
+                if time.time() - start > timeout:
+                    os.close(fd)
+                    return None
+                time.sleep(0.05)
+    except Exception:
+        return None
+
+
+def release_file_lock(fd):
+    if fd is not None:
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def cmd_cuentas_json() -> dict:
+    token_path = get_token_path(auto_sync=False)
+    cuentas_dir = get_cuentas_dir()
+    active_profile = find_active_profile_name(cuentas_dir, token_path) if token_path.is_file() else ""
+    guardadas = sorted(cuentas_dir.glob("*.token"))
+    accounts = []
+    for f in guardadas:
+        p_name = f.stem
+        is_active = (p_name == active_profile)
+        email = decode_email_from_token(f)
+        plan = "Antigravity"
+        try:
+            f_data = json.loads(f.read_text(encoding="utf-8"))
+            plan = f_data.get("plan") or plan
+        except Exception:
+            pass
+        accounts.append({
+            "alias": p_name,
+            "es_activa": is_active,
+            "identificador_enmascarado": mask_identifier(email),
+            "plan": plan.upper(),
+            "estado": "disponible"
+        })
+    return {
+        "disponible": True,
+        "perfil_activo": active_profile,
+        "cuentas": accounts
+    }
+
+
+def cmd_cuota_json(target: str = "") -> dict:
+    token_path = get_token_path(auto_sync=False)
+    cuentas_dir = get_cuentas_dir()
+    active_profile = find_active_profile_name(cuentas_dir, token_path) if token_path.is_file() else ""
+    guardadas = sorted(cuentas_dir.glob("*.token"))
+    if target:
+        guardadas = [f for f in guardadas if f.stem == target]
+
+    now_dt = datetime.now(timezone.utc)
+    accounts = []
+    for f in guardadas:
+        p_name = f.stem
+        is_active = (p_name == active_profile)
+        email = decode_email_from_token(f)
+        plan = "Antigravity"
+        try:
+            f_data = json.loads(f.read_text(encoding="utf-8"))
+            plan = f_data.get("plan") or plan
+        except Exception:
+            pass
+
+        try:
+            q = fetch_agy_quota(f, active_profile="")
+        except Exception as e:
+            q = {"err_msg": str(e)}
+
+        err = q.get("err_msg")
+        models = q.get("models", {})
+        models_data = {}
+        if isinstance(models, dict):
+            for m_name, m_info in models.items():
+                if isinstance(m_info, dict):
+                    q_info = m_info.get("quotaInfo", {}) if isinstance(m_info.get("quotaInfo"), dict) else {}
+                    frac = float(q_info.get("remainingFraction", 1.0))
+                    reset_str = q_info.get("resetTime", "")
+                    models_data[m_name] = {
+                        "restante_porcentaje": round(frac * 100, 1),
+                        "resetea_en_timestamp": reset_str or None,
+                        "agotada": frac <= 0.05
+                    }
+
+        status_code = "disponible"
+        if err:
+            err_lower = err.lower()
+            if "expirado" in err_lower or "401" in err_lower or "login" in err_lower:
+                status_code = "invalid_auth"
+            elif "conexión" in err_lower or "conexion" in err_lower or "timeout" in err_lower:
+                status_code = "network_error"
+            else:
+                status_code = "unknown_quota"
+
+        accounts.append({
+            "alias": p_name,
+            "es_activa": is_active,
+            "identificador_enmascarado": mask_identifier(email),
+            "plan": plan.upper(),
+            "estado": status_code,
+            "error": err,
+            "frescura": now_dt.isoformat(),
+            "modelos": models_data
+        })
+
+    return {
+        "disponible": True,
+        "perfil_activo": active_profile,
+        "cuentas": accounts
+    }
+
+
+def cmd_ocupacion_json() -> dict:
+    running_clients = find_running_clients("agy")
+    token_path = get_token_path(auto_sync=False)
+    cuentas_dir = get_cuentas_dir()
+    active_profile = find_active_profile_name(cuentas_dir, token_path) if token_path.is_file() else ""
+    is_busy = len(running_clients) > 0
+    return {
+        "ocupado": is_busy,
+        "puede_conmutar": not is_busy,
+        "motivo": "active_session" if is_busy else None,
+        "descripcion": f"{len(running_clients)} sesión(es) de Antigravity activa(s)" if is_busy else "Sin sesiones activas",
+        "perfil_activo": active_profile,
+        "procesos": running_clients
+    }
+
+
+def cmd_seleccionar_json(nombre: str, dry_run: bool = False, lock_timeout: int = 5) -> dict:
+    validate_alias(nombre)
+    cuentas_dir = get_cuentas_dir()
+    src = cuentas_dir / f"{nombre}.token"
+    if not src.is_file():
+        return {
+            "solicitud": {"proveedor": "agy", "cuenta_destino": nombre, "dry_run": dry_run},
+            "permitido": False,
+            "codigo": "invalid_auth",
+            "mensaje": f"La cuenta '{nombre}' no existe en {cuentas_dir}",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    running = find_running_clients("agy")
+    if running:
+        return {
+            "solicitud": {"proveedor": "agy", "cuenta_destino": nombre, "dry_run": dry_run},
+            "permitido": False,
+            "codigo": "active_session",
+            "mensaje": f"No se puede conmutar: se detectaron {len(running)} sesiones activas de Antigravity.",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False,
+            "procesos": running
+        }
+    if dry_run:
+        return {
+            "solicitud": {"proveedor": "agy", "cuenta_destino": nombre, "dry_run": True},
+            "permitido": True,
+            "codigo": "ok",
+            "mensaje": "Conmutación viable y segura (dry-run verificado)",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    lock_file = get_base_dir() / "switch.lock"
+    fd = acquire_file_lock(lock_file, timeout=float(lock_timeout))
+    if fd is None:
+        return {
+            "solicitud": {"proveedor": "agy", "cuenta_destino": nombre, "dry_run": False},
+            "permitido": False,
+            "codigo": "lock_failed",
+            "mensaje": "No se pudo adquirir el bloqueo atómico para conmutación",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    try:
+        token_path = get_token_path(auto_sync=False)
+        active_before = find_active_profile_name(cuentas_dir, token_path)
+        private_copy(src, token_path)
+        try:
+            raw_tok = token_path.read_text(encoding="utf-8")
+            if not sync_token_to_keyring(raw_tok):
+                clear_token_from_keyring()
+        except Exception:
+            pass
+        return {
+            "solicitud": {"proveedor": "agy", "cuenta_destino": nombre, "dry_run": False},
+            "permitido": True,
+            "codigo": "ok",
+            "mensaje": f"Cuenta conmutada exitosamente a '{nombre}' de forma atómica.",
+            "bloqueo_adquirido": True,
+            "cambio_realizado": True,
+            "cuenta_previa": active_before,
+            "cuenta_activa": nombre
+        }
+    finally:
+        release_file_lock(fd)
+
+
+def cmd_paralelo(nombre: str, extra_cmd: list[str]):
+    validate_alias(nombre)
+    cuentas_dir = get_cuentas_dir()
+    src = cuentas_dir / f"{nombre}.token"
+    if not src.is_file():
+        print(f"❌ Error: La cuenta '{nombre}' no existe en {cuentas_dir}.", file=sys.stderr)
+        sys.exit(1)
+
+    runtime_dir = get_base_dir() / "runtimes" / nombre
+    runtime_agy_dir = runtime_dir / ".gemini" / "antigravity-cli"
+    runtime_agy_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    isolated_token = runtime_agy_dir / "antigravity-oauth-token"
+    private_copy(src, isolated_token)
+
+    real_home = Path(os.environ.get("HOME", Path.home()))
+    for item in [".gitconfig", ".ssh"]:
+        target = real_home / item
+        link_name = runtime_dir / item
+        if target.exists() and not link_name.exists():
+            try:
+                os.symlink(target, link_name)
+            except Exception:
+                pass
+
+    gemini_config = real_home / ".gemini" / "config"
+    runtime_gemini = runtime_dir / ".gemini"
+    runtime_gemini.mkdir(parents=True, exist_ok=True)
+    runtime_config_link = runtime_gemini / "config"
+    if gemini_config.exists() and not runtime_config_link.exists():
+        try:
+            os.symlink(gemini_config, runtime_config_link)
+        except Exception:
+            pass
+
+    isolated_env = os.environ.copy()
+    isolated_env["HOME"] = str(runtime_dir)
+    isolated_env["DBUS_SESSION_BUS_ADDRESS"] = ""
+    isolated_env["XDG_DATA_HOME"] = str(runtime_dir / ".local" / "share")
+    isolated_env["XDG_CONFIG_HOME"] = str(runtime_dir / ".config")
+    isolated_env["AGY_PROFILE"] = nombre
+
+    cmd_to_run = extra_cmd if extra_cmd else ["agy"]
+    try:
+        res = subprocess.run(cmd_to_run, env=isolated_env)
+        ret = res.returncode
+    except FileNotFoundError:
+        print(f"❌ Error: No se encontró el ejecutable '{cmd_to_run[0]}'.", file=sys.stderr)
+        ret = 127
+    except KeyboardInterrupt:
+        ret = 130
+
+    if isolated_token.is_file():
+        try:
+            if isolated_token.read_bytes() != src.read_bytes():
+                private_copy(isolated_token, src)
+        except Exception:
+            pass
+
+    sys.exit(ret)
+
+
 def main():
     args = sys.argv[1:]
+    if "--json" in args:
+        if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
+            target = [a for a in args[1:] if not a.startswith("-")]
+            t = target[0] if target else ""
+            print(json.dumps(cmd_cuota_json(t), indent=2))
+            sys.exit(0)
+        elif args[0] in ("cuentas", "accounts", "listar", "list", "ls"):
+            print(json.dumps(cmd_cuentas_json(), indent=2))
+            sys.exit(0)
+        elif args[0] in ("ocupacion", "ocupado", "sesiones", "clients"):
+            res = cmd_ocupacion_json()
+            print(json.dumps(res, indent=2))
+            sys.exit(0 if not res.get("ocupado") else 1)
+        elif args[0] in ("seleccionar", "select", "usar", "use"):
+            target = [a for a in args[1:] if not a.startswith("-")]
+            t = target[0] if target else ""
+            dry_run = "--dry-run" in args
+            res = cmd_seleccionar_json(t, dry_run=dry_run)
+            print(json.dumps(res, indent=2))
+            sys.exit(0 if res.get("permitido") else 1)
+
     if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
         target = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         cmd_status(target)
@@ -1444,6 +1757,37 @@ def main():
             print(cid)
         else:
             sys.exit(1)
+    elif args[0] in ("cuentas", "accounts"):
+        print(json.dumps(cmd_cuentas_json(), indent=2))
+        sys.exit(0)
+    elif args[0] in ("cuota", "quota"):
+        target = [a for a in args[1:] if not a.startswith("-")]
+        t = target[0] if target else ""
+        print(json.dumps(cmd_cuota_json(t), indent=2))
+        sys.exit(0)
+    elif args[0] in ("ocupacion", "ocupado", "sesiones", "clients"):
+        res = cmd_ocupacion_json()
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if not res.get("ocupado") else 1)
+    elif args[0] in ("seleccionar", "select"):
+        target = [a for a in args[1:] if not a.startswith("-")]
+        t = target[0] if target else ""
+        dry_run = "--dry-run" in args
+        res = cmd_seleccionar_json(t, dry_run=dry_run)
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("permitido") else 1)
+    elif args[0] in ("paralelo", "parallel", "spawn"):
+        if len(args) < 2:
+            print("Uso: agy-switch paralelo <cuenta> [-- <comando>...]")
+            sys.exit(1)
+        nombre = args[1]
+        extra_cmd = []
+        if "--" in args:
+            dash_idx = args.index("--")
+            extra_cmd = args[dash_idx + 1:]
+        elif len(args) > 2:
+            extra_cmd = args[2:]
+        cmd_paralelo(nombre, extra_cmd)
     elif args[0] in ("ayuda", "help", "--help", "-h"):
         print("Uso: agy-switch [comando] [argumentos]")
         print("\nComandos disponibles:")

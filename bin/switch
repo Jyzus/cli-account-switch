@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import shutil
 import subprocess
 import tempfile
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 GITHUB_REPO = "Jyzus/cli-account-switch"
 INSTALL_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
 
@@ -23,12 +25,14 @@ def find_tool(name: str) -> Path | None:
     here = Path(__file__).resolve().parent
     candidates = [
         here / name,
-        Path.home() / ".local" / "bin" / name,
-        Path("/usr/local/bin") / name,
     ]
     which = shutil.which(name)
     if which:
-        candidates.insert(0, Path(which))
+        candidates.append(Path(which))
+    candidates.extend([
+        Path.home() / ".local" / "bin" / name,
+        Path("/usr/local/bin") / name,
+    ])
     for c in candidates:
         if c.is_file() and os.access(c, os.X_OK):
             return c
@@ -229,11 +233,270 @@ def cmd_listar():
         subprocess.run([sys.executable, str(agy_tool), "listar"])
 
 
+def run_tool_json(tool_name: str, args: list[str]) -> dict | None:
+    t = find_tool(tool_name)
+    if not t:
+        return None
+    cmd = [sys.executable, str(t)] + args
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.stdout.strip():
+            return json.loads(res.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def cmd_cuentas_json(provider_filter: str = ""):
+    filter_norm = provider_filter.lower().strip()
+    include_codex = not filter_norm or filter_norm in ("codex", "openai")
+    include_agy = not filter_norm or filter_norm in ("agy", "antigravity", "gemini")
+    include_opencode = not filter_norm or filter_norm in ("opencode",)
+
+    proveedores = {}
+    if include_codex:
+        proveedores["codex"] = run_tool_json("codex-switch", ["cuentas", "--json"]) or {
+            "disponible": False,
+            "perfil_activo": "",
+            "cuentas": [],
+            "error": "No disponible"
+        }
+    if include_agy:
+        proveedores["agy"] = run_tool_json("agy-switch", ["cuentas", "--json"]) or {
+            "disponible": False,
+            "perfil_activo": "",
+            "cuentas": [],
+            "error": "No disponible"
+        }
+    if include_opencode:
+        proveedores["opencode"] = {
+            "disponible": False,
+            "capacidad": "unsupported_capability",
+            "mensaje": "OpenCode no cuenta con adaptador de cuentas o cuota en Switch.",
+            "cuentas": []
+        }
+
+    return {
+        "version": VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "proveedores": proveedores
+    }
+
+
+def cmd_cuota_json(target: str = "", provider_filter: str = ""):
+    filter_norm = provider_filter.lower().strip()
+    include_codex = not filter_norm or filter_norm in ("codex", "openai")
+    include_agy = not filter_norm or filter_norm in ("agy", "antigravity", "gemini")
+    include_opencode = not filter_norm or filter_norm in ("opencode",)
+
+    codex_args = ["cuota", "--json"] + ([target] if target else [])
+    agy_args = ["cuota", "--json"] + ([target] if target else [])
+
+    proveedores = {}
+    if include_codex:
+        proveedores["codex"] = run_tool_json("codex-switch", codex_args) or {
+            "disponible": False,
+            "perfil_activo": "",
+            "cuentas": [],
+            "error": "No disponible"
+        }
+    if include_agy:
+        proveedores["agy"] = run_tool_json("agy-switch", agy_args) or {
+            "disponible": False,
+            "perfil_activo": "",
+            "cuentas": [],
+            "error": "No disponible"
+        }
+    if include_opencode:
+        proveedores["opencode"] = {
+            "disponible": False,
+            "capacidad": "unsupported_capability",
+            "mensaje": "OpenCode no cuenta con adaptador de cuentas o cuota en Switch.",
+            "cuentas": []
+        }
+
+    return {
+        "version": VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "proveedores": proveedores
+    }
+
+
+def cmd_ocupacion_json(provider_filter: str = ""):
+    filter_norm = provider_filter.lower().strip()
+    include_codex = not filter_norm or filter_norm in ("codex", "openai")
+    include_agy = not filter_norm or filter_norm in ("agy", "antigravity", "gemini")
+    include_opencode = not filter_norm or filter_norm in ("opencode",)
+
+    proveedores = {}
+    if include_codex:
+        proveedores["codex"] = run_tool_json("codex-switch", ["ocupacion", "--json"]) or {
+            "ocupado": False,
+            "puede_conmutar": False,
+            "error": "codex-switch no disponible"
+        }
+    if include_agy:
+        proveedores["agy"] = run_tool_json("agy-switch", ["ocupacion", "--json"]) or {
+            "ocupado": False,
+            "puede_conmutar": False,
+            "error": "agy-switch no disponible"
+        }
+    if include_opencode:
+        proveedores["opencode"] = {
+            "ocupado": False,
+            "capacidad": "unsupported_capability",
+            "puede_conmutar": False
+        }
+
+    return {
+        "version": VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "proveedores": proveedores
+    }
+
+
+def cmd_seleccionar_json(prov: str, cuenta: str, dry_run: bool = False):
+    prov = prov.lower()
+    if prov in ("opencode",):
+        return {
+            "solicitud": {"proveedor": "opencode", "cuenta_destino": cuenta, "dry_run": dry_run},
+            "permitido": False,
+            "codigo": "unsupported_capability",
+            "mensaje": "OpenCode no cuenta con soporte en Switch para conmutación de cuentas.",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    if prov in ("codex", "openai"):
+        args = ["seleccionar", cuenta, "--json"] + (["--dry-run"] if dry_run else [])
+        res = run_tool_json("codex-switch", args)
+        if res:
+            return res
+        return {
+            "solicitud": {"proveedor": "codex", "cuenta_destino": cuenta, "dry_run": dry_run},
+            "permitido": False,
+            "codigo": "invalid_auth",
+            "mensaje": "Error al comunicar con codex-switch",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    if prov in ("agy", "antigravity", "gemini"):
+        args = ["seleccionar", cuenta, "--json"] + (["--dry-run"] if dry_run else [])
+        res = run_tool_json("agy-switch", args)
+        if res:
+            return res
+        return {
+            "solicitud": {"proveedor": "agy", "cuenta_destino": cuenta, "dry_run": dry_run},
+            "permitido": False,
+            "codigo": "invalid_auth",
+            "mensaje": "Error al comunicar con agy-switch",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    return {
+        "solicitud": {"proveedor": prov, "cuenta_destino": cuenta, "dry_run": dry_run},
+        "permitido": False,
+        "codigo": "unsupported_capability",
+        "mensaje": f"Proveedor '{prov}' desconocido",
+        "bloqueo_adquirido": False,
+        "cambio_realizado": False
+    }
+
+
 def main():
     args = sys.argv[1:]
+    is_json = "--json" in args
+
+    if is_json:
+        if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
+            positionals = [a for a in args[1:] if not a.startswith("-")]
+            prov_filter = ""
+            target = ""
+            if len(positionals) >= 2:
+                prov_filter = positionals[0]
+                target = positionals[1]
+            elif len(positionals) == 1:
+                if positionals[0].lower() in ("codex", "agy", "opencode", "openai", "gemini", "antigravity"):
+                    prov_filter = positionals[0]
+                else:
+                    target = positionals[0]
+            print(json.dumps(cmd_cuota_json(target=target, provider_filter=prov_filter), indent=2))
+            sys.exit(0)
+        elif args[0] in ("cuentas", "accounts", "listar", "list", "ls"):
+            prov_filter = ""
+            for a in args[1:]:
+                if not a.startswith("-"):
+                    prov_filter = a
+                    break
+            print(json.dumps(cmd_cuentas_json(prov_filter), indent=2))
+            sys.exit(0)
+        elif args[0] in ("ocupacion", "ocupado", "sesiones"):
+            prov_filter = ""
+            for a in args[1:]:
+                if not a.startswith("-"):
+                    prov_filter = a
+                    break
+            res = cmd_ocupacion_json(prov_filter)
+            print(json.dumps(res, indent=2))
+            sys.exit(0)
+        elif args[0] in ("seleccionar", "select"):
+            positionals = [a for a in args[1:] if not a.startswith("-")]
+            if len(positionals) < 2:
+                print("Uso: switch seleccionar <proveedor> <cuenta> [--dry-run] [--json]")
+                sys.exit(1)
+            prov = positionals[0]
+            cuenta = positionals[1]
+            dry_run = "--dry-run" in args
+            res = cmd_seleccionar_json(prov, cuenta, dry_run=dry_run)
+            print(json.dumps(res, indent=2))
+            sys.exit(0 if res.get("permitido") else 1)
+
     if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
         target = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         cmd_status(target)
+    elif args[0] in ("cuentas", "accounts"):
+        print(json.dumps(cmd_cuentas_json(), indent=2))
+    elif args[0] in ("cuota", "quota"):
+        target = [a for a in args[1:] if not a.startswith("-")]
+        t = target[0] if target else ""
+        print(json.dumps(cmd_cuota_json(t), indent=2))
+    elif args[0] in ("ocupacion", "ocupado", "sesiones"):
+        res = cmd_ocupacion_json()
+        print(json.dumps(res, indent=2))
+    elif args[0] in ("seleccionar", "select"):
+        positionals = [a for a in args[1:] if not a.startswith("-")]
+        if len(positionals) < 2:
+            print("Uso: switch seleccionar <proveedor> <cuenta> [--dry-run] [--json]")
+            sys.exit(1)
+        prov = positionals[0]
+        cuenta = positionals[1]
+        dry_run = "--dry-run" in args
+        res = cmd_seleccionar_json(prov, cuenta, dry_run=dry_run)
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("permitido") else 1)
+    elif args[0] in ("paralelo", "parallel", "spawn"):
+        if len(args) < 3:
+            print("Uso: switch paralelo <proveedor> <cuenta> [-- <comando>...]")
+            print("  Proveedores: agy | codex")
+            sys.exit(1)
+        prov = args[1].lower()
+        cuenta = args[2]
+        extra_cmd = []
+        if "--" in args:
+            dash_idx = args.index("--")
+            extra_cmd = args[dash_idx + 1:]
+        elif len(args) > 3:
+            extra_cmd = args[3:]
+
+        if prov in ("agy", "antigravity", "gemini"):
+            exec_subcommand("agy-switch", ["paralelo", cuenta] + (["--"] + extra_cmd if extra_cmd else []))
+        elif prov in ("codex", "openai"):
+            exec_subcommand("codex-switch", ["paralelo", cuenta] + (["--"] + extra_cmd if extra_cmd else []))
+        elif prov in ("opencode",):
+            print("❌ Error: OpenCode no cuenta con adaptador de ejecución paralela en Switch.", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"❌ Error: Proveedor desconocido '{prov}'. Usa 'agy' o 'codex'.", file=sys.stderr)
+            sys.exit(1)
     elif args[0] in ("tray", "barra", "taskbar"):
         exec_subcommand("switch-tray", args[1:])
     elif args[0] in ("widget", "gui", "ui", "dashboard"):

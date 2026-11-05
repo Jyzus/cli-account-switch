@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 GITHUB_REPO = "Jyzus/cli-account-switch"
 INSTALL_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
 
@@ -65,6 +65,8 @@ def decode_account_from_auth(auth_file: Path) -> str:
         return "No configurada (sin auth.json)"
     try:
         data = json.loads(auth_file.read_text(encoding="utf-8"))
+        if data.get("email"):
+            return data["email"]
         tokens = data.get("tokens", {})
         id_token = tokens.get("id_token", "")
         if id_token and "." in id_token:
@@ -1162,8 +1164,325 @@ def cmd_actualizar(extra_args: list = None):
             print(f"  ⚠️ No se pudo ejecutar 'codex update': {e}")
 
 
+def mask_identifier(ident: str) -> str:
+    if not ident:
+        return "Desconocido"
+    if "@" in ident:
+        parts = ident.split("@", 1)
+        user, domain = parts[0], parts[1]
+        if len(user) <= 1:
+            masked_user = user + "***"
+        elif len(user) == 2:
+            masked_user = user[0] + "***"
+        else:
+            masked_user = user[0] + "***" + user[-1]
+        return f"{masked_user}@{domain}"
+    if len(ident) > 6:
+        return ident[:2] + "***" + ident[-2:]
+    return "***"
+
+
+def acquire_file_lock(lock_file: Path, timeout: float = 3.0):
+    try:
+        import fcntl
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+        start = time.time()
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except (BlockingIOError, OSError):
+                if time.time() - start > timeout:
+                    os.close(fd)
+                    return None
+                time.sleep(0.05)
+    except Exception:
+        return None
+
+
+def release_file_lock(fd):
+    if fd is not None:
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def cmd_cuentas_json() -> dict:
+    auth_path = get_auth_path()
+    cuentas_dir = get_cuentas_dir()
+    active_profile = find_active_profile_name(cuentas_dir, auth_path) if auth_path.is_file() else ""
+    guardadas = sorted(cuentas_dir.glob("*.json"))
+    accounts = []
+    for f in guardadas:
+        p_name = f.stem
+        is_active = (p_name == active_profile)
+        email = decode_account_from_auth(f)
+        plan = "DESCONOCIDO"
+        try:
+            f_data = json.loads(f.read_text(encoding="utf-8"))
+            plan = f_data.get("plan_type") or plan
+        except Exception:
+            pass
+        accounts.append({
+            "alias": p_name,
+            "es_activa": is_active,
+            "identificador_enmascarado": mask_identifier(email),
+            "plan": plan.upper(),
+            "estado": "disponible"
+        })
+    return {
+        "disponible": True,
+        "perfil_activo": active_profile,
+        "cuentas": accounts
+    }
+
+
+def cmd_cuota_json(target: str = "") -> dict:
+    auth_path = get_auth_path()
+    cuentas_dir = get_cuentas_dir()
+    active_profile = find_active_profile_name(cuentas_dir, auth_path) if auth_path.is_file() else ""
+    guardadas = sorted(cuentas_dir.glob("*.json"))
+    if target:
+        guardadas = [f for f in guardadas if f.stem == target]
+
+    now_dt = datetime.now(timezone.utc)
+    accounts = []
+    for f in guardadas:
+        p_name = f.stem
+        is_active = (p_name == active_profile)
+        email = decode_account_from_auth(f)
+        plan = "DESCONOCIDO"
+        try:
+            f_data = json.loads(f.read_text(encoding="utf-8"))
+            plan = f_data.get("plan_type") or plan
+        except Exception:
+            pass
+
+        try:
+            q = fetch_codex_quota(f, active_profile="")
+        except Exception as e:
+            q = {"err_msg": str(e)}
+
+        err = q.get("err_msg")
+        rate = q.get("rate_limit") or {}
+        allowed = rate.get("allowed", True)
+        pw = rate.get("primary_window") or {}
+        sw = rate.get("secondary_window") or {}
+
+        ventanas = []
+        if pw:
+            used = float(pw.get("used_percent", 0))
+            rem = max(0.0, 100.0 - used)
+            res_sec = int(pw.get("reset_after_seconds", 0))
+            win_sec = int(pw.get("limit_window_seconds", 18000))
+            res_ts = datetime.fromtimestamp(now_dt.timestamp() + res_sec, tz=timezone.utc).isoformat() if res_sec > 0 else None
+            ventanas.append({
+                "tipo": "primaria",
+                "etiqueta": f"{win_sec // 3600} horas" if win_sec < 86400 else f"{win_sec // 86400} días",
+                "usado_porcentaje": used,
+                "restante_porcentaje": rem,
+                "ventana_segundos": win_sec,
+                "resetea_en_segundos": res_sec,
+                "resetea_en_timestamp": res_ts,
+                "agotada": (not allowed) or (rem <= 5.0),
+                "riesgo_agotamiento": "alto" if used >= 80 else ("medio" if used >= 50 else "bajo")
+            })
+        if sw:
+            s_used = float(sw.get("used_percent", 0))
+            s_rem = max(0.0, 100.0 - s_used)
+            s_res_sec = int(sw.get("reset_after_seconds", 0))
+            s_win_sec = int(sw.get("limit_window_seconds", 604800))
+            s_res_ts = datetime.fromtimestamp(now_dt.timestamp() + s_res_sec, tz=timezone.utc).isoformat() if s_res_sec > 0 else None
+            ventanas.append({
+                "tipo": "secundaria",
+                "etiqueta": "Semanal (7d)",
+                "usado_porcentaje": s_used,
+                "restante_porcentaje": s_rem,
+                "ventana_segundos": s_win_sec,
+                "resetea_en_segundos": s_res_sec,
+                "resetea_en_timestamp": s_res_ts,
+                "agotada": s_rem <= 5.0,
+                "riesgo_agotamiento": "alto" if s_used >= 80 else ("medio" if s_used >= 50 else "bajo")
+            })
+
+        status_code = "disponible"
+        if err:
+            err_lower = err.lower()
+            if "expirada" in err_lower or "401" in err_lower or "login" in err_lower:
+                status_code = "invalid_auth"
+            elif "conexión" in err_lower or "conexion" in err_lower or "timeout" in err_lower:
+                status_code = "network_error"
+            else:
+                status_code = "unknown_quota"
+        elif not allowed:
+            status_code = "agotada"
+
+        accounts.append({
+            "alias": p_name,
+            "es_activa": is_active,
+            "identificador_enmascarado": mask_identifier(email),
+            "plan": (q.get("plan_type") or plan).upper(),
+            "estado": status_code,
+            "error": err,
+            "frescura": now_dt.isoformat(),
+            "ventanas": ventanas
+        })
+
+    return {
+        "disponible": True,
+        "perfil_activo": active_profile,
+        "cuentas": accounts
+    }
+
+
+def cmd_ocupacion_json() -> dict:
+    running_clients = find_running_clients("codex")
+    auth_path = get_auth_path()
+    cuentas_dir = get_cuentas_dir()
+    active_profile = find_active_profile_name(cuentas_dir, auth_path) if auth_path.is_file() else ""
+    daemon_running = daemon_is_running()
+    is_busy = len(running_clients) > 0
+    return {
+        "ocupado": is_busy or daemon_running,
+        "puede_conmutar": not is_busy,
+        "motivo": "active_session" if (is_busy or daemon_running) else None,
+        "descripcion": f"{len(running_clients)} cliente(s) interactivo(s) activo(s)" if is_busy else ("Daemon activo con conexiones potenciales" if daemon_running else "Sin sesiones activas"),
+        "perfil_activo": active_profile,
+        "daemon_activo": daemon_running,
+        "procesos": running_clients
+    }
+
+
+def cmd_seleccionar_json(nombre: str, dry_run: bool = False, lock_timeout: int = 5) -> dict:
+    validate_alias(nombre)
+    cuentas_dir = get_cuentas_dir()
+    src = cuentas_dir / f"{nombre}.json"
+    if not src.is_file():
+        return {
+            "solicitud": {"proveedor": "codex", "cuenta_destino": nombre, "dry_run": dry_run},
+            "permitido": False,
+            "codigo": "invalid_auth",
+            "mensaje": f"La cuenta '{nombre}' no existe en {cuentas_dir}",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    running = find_running_clients("codex")
+    if running:
+        return {
+            "solicitud": {"proveedor": "codex", "cuenta_destino": nombre, "dry_run": dry_run},
+            "permitido": False,
+            "codigo": "active_session",
+            "mensaje": f"No se puede conmutar: se detectaron {len(running)} procesos/sesiones activas de Codex.",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False,
+            "procesos": running
+        }
+    if dry_run:
+        return {
+            "solicitud": {"proveedor": "codex", "cuenta_destino": nombre, "dry_run": True},
+            "permitido": True,
+            "codigo": "ok",
+            "mensaje": "Conmutación viable y segura (dry-run verificado)",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    lock_file = codex_home / "switch.lock"
+    fd = acquire_file_lock(lock_file, timeout=float(lock_timeout))
+    if fd is None:
+        return {
+            "solicitud": {"proveedor": "codex", "cuenta_destino": nombre, "dry_run": False},
+            "permitido": False,
+            "codigo": "lock_failed",
+            "mensaje": "No se pudo adquirir el bloqueo atómico para conmutación",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    try:
+        auth_path = get_auth_path()
+        active_before = find_active_profile_name(cuentas_dir, auth_path)
+        selected = src.read_bytes()
+        write_auth_atomic(auth_path, selected)
+        return {
+            "solicitud": {"proveedor": "codex", "cuenta_destino": nombre, "dry_run": False},
+            "permitido": True,
+            "codigo": "ok",
+            "mensaje": f"Cuenta conmutada exitosamente a '{nombre}' de forma atómica.",
+            "bloqueo_adquirido": True,
+            "cambio_realizado": True,
+            "cuenta_previa": active_before,
+            "cuenta_activa": nombre
+        }
+    finally:
+        release_file_lock(fd)
+
+
+def cmd_paralelo(nombre: str, extra_cmd: list[str]):
+    validate_alias(nombre)
+    cuentas_dir = get_cuentas_dir()
+    src = cuentas_dir / f"{nombre}.json"
+    if not src.is_file():
+        print(f"❌ Error: La cuenta '{nombre}' no existe en {cuentas_dir}.", file=sys.stderr)
+        sys.exit(1)
+
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    runtime_dir = codex_home / "runtimes" / nombre
+    runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    isolated_auth = runtime_dir / "auth.json"
+    private_copy(src, isolated_auth)
+
+    isolated_env = os.environ.copy()
+    isolated_env["CODEX_HOME"] = str(runtime_dir)
+    isolated_env["CODEX_PROFILE"] = nombre
+
+    cmd_to_run = extra_cmd if extra_cmd else ["codex"]
+    try:
+        res = subprocess.run(cmd_to_run, env=isolated_env)
+        ret = res.returncode
+    except FileNotFoundError:
+        print(f"❌ Error: No se encontró el ejecutable '{cmd_to_run[0]}'.", file=sys.stderr)
+        ret = 127
+    except KeyboardInterrupt:
+        ret = 130
+
+    if isolated_auth.is_file():
+        try:
+            if isolated_auth.read_bytes() != src.read_bytes():
+                private_copy(isolated_auth, src)
+        except Exception:
+            pass
+
+    sys.exit(ret)
+
+
 def main():
     args = sys.argv[1:]
+    if "--json" in args:
+        if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
+            target = [a for a in args[1:] if not a.startswith("-")]
+            t = target[0] if target else ""
+            print(json.dumps(cmd_cuota_json(t), indent=2))
+            sys.exit(0)
+        elif args[0] in ("cuentas", "accounts", "listar", "list", "ls"):
+            print(json.dumps(cmd_cuentas_json(), indent=2))
+            sys.exit(0)
+        elif args[0] in ("ocupacion", "ocupado", "sesiones", "clients"):
+            res = cmd_ocupacion_json()
+            print(json.dumps(res, indent=2))
+            sys.exit(0 if not res.get("ocupado") else 1)
+        elif args[0] in ("seleccionar", "select", "usar", "use"):
+            target = [a for a in args[1:] if not a.startswith("-")]
+            t = target[0] if target else ""
+            dry_run = "--dry-run" in args
+            res = cmd_seleccionar_json(t, dry_run=dry_run)
+            print(json.dumps(res, indent=2))
+            sys.exit(0 if res.get("permitido") else 1)
+
     if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
         target = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         cmd_status(target)
@@ -1241,6 +1560,37 @@ def main():
             print(sid)
         else:
             sys.exit(1)
+    elif args[0] in ("cuentas", "accounts"):
+        print(json.dumps(cmd_cuentas_json(), indent=2))
+        sys.exit(0)
+    elif args[0] in ("cuota", "quota"):
+        target = [a for a in args[1:] if not a.startswith("-")]
+        t = target[0] if target else ""
+        print(json.dumps(cmd_cuota_json(t), indent=2))
+        sys.exit(0)
+    elif args[0] in ("ocupacion", "ocupado", "sesiones", "clients"):
+        res = cmd_ocupacion_json()
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if not res.get("ocupado") else 1)
+    elif args[0] in ("seleccionar", "select"):
+        target = [a for a in args[1:] if not a.startswith("-")]
+        t = target[0] if target else ""
+        dry_run = "--dry-run" in args
+        res = cmd_seleccionar_json(t, dry_run=dry_run)
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("permitido") else 1)
+    elif args[0] in ("paralelo", "parallel", "spawn"):
+        if len(args) < 2:
+            print("Uso: codex-switch paralelo <cuenta> [-- <comando>...]")
+            sys.exit(1)
+        nombre = args[1]
+        extra_cmd = []
+        if "--" in args:
+            dash_idx = args.index("--")
+            extra_cmd = args[dash_idx + 1:]
+        elif len(args) > 2:
+            extra_cmd = args[2:]
+        cmd_paralelo(nombre, extra_cmd)
     elif args[0] in ("ayuda", "help", "--help", "-h"):
         print("Uso: codex-switch [comando] [argumentos]")
         print("\nComandos disponibles:")
