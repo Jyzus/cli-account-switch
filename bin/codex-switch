@@ -17,6 +17,8 @@ import tempfile
 import urllib.request
 import urllib.parse
 import urllib.error
+import fcntl
+import hashlib
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -87,6 +89,8 @@ def extract_account_key(auth_file: Path) -> str:
         return ""
     try:
         data = json.loads(auth_file.read_text(encoding="utf-8"))
+        if data.get("email"):
+            return f"email:{data['email'].lower().strip()}"
         tokens = data.get("tokens", {})
         id_token = tokens.get("id_token", "")
         if id_token and "." in id_token:
@@ -111,6 +115,18 @@ def extract_account_key(auth_file: Path) -> str:
         return ""
     except Exception:
         return ""
+
+def compute_opaque_identity(auth_file: Path) -> str:
+    """Calcula una identidad opaca estable por sha256 a partir de la identidad real extraída."""
+    key = extract_account_key(auth_file)
+    if key:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    if auth_file.is_file():
+        try:
+            return hashlib.sha256(auth_file.read_bytes()).hexdigest()[:16]
+        except Exception:
+            pass
+    return ""
 
 def get_most_recent_session_id() -> str:
     index_file = get_base_dir() / "session_index.jsonl"
@@ -1231,6 +1247,7 @@ def cmd_cuentas_json() -> dict:
             "alias": p_name,
             "es_activa": is_active,
             "identificador_enmascarado": mask_identifier(email),
+            "identidad_opaca": compute_opaque_identity(f),
             "plan": plan.upper(),
             "estado": "disponible"
         })
@@ -1325,6 +1342,7 @@ def cmd_cuota_json(target: str = "") -> dict:
             "alias": p_name,
             "es_activa": is_active,
             "identificador_enmascarado": mask_identifier(email),
+            "identidad_opaca": compute_opaque_identity(f),
             "plan": (q.get("plan_type") or plan).upper(),
             "estado": status_code,
             "error": err,
@@ -1339,21 +1357,56 @@ def cmd_cuota_json(target: str = "") -> dict:
     }
 
 
+def find_active_parallel_leases() -> list[str]:
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    runtimes_dir = codex_home / "runtimes"
+    if not runtimes_dir.is_dir():
+        return []
+    busy_leases = []
+    for lease_file in runtimes_dir.glob("*.lease"):
+        if lease_file.name.startswith(".id_"):
+            continue
+        try:
+            fd = os.open(str(lease_file), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except (BlockingIOError, OSError):
+                busy_leases.append(lease_file.stem)
+            finally:
+                os.close(fd)
+        except Exception:
+            pass
+    return busy_leases
+
+
 def cmd_ocupacion_json() -> dict:
     running_clients = find_running_clients("codex")
+    parallel_busy = find_active_parallel_leases()
     auth_path = get_auth_path()
     cuentas_dir = get_cuentas_dir()
     active_profile = find_active_profile_name(cuentas_dir, auth_path) if auth_path.is_file() else ""
     daemon_running = daemon_is_running()
-    is_busy = len(running_clients) > 0
+    is_busy = len(running_clients) > 0 or len(parallel_busy) > 0
+    desc = []
+    if running_clients:
+        desc.append(f"{len(running_clients)} cliente(s) interactivo(s) activo(s)")
+    if parallel_busy:
+        desc.append(f"{len(parallel_busy)} worker(s) paralelo(s) activo(s): {', '.join(parallel_busy)}")
+    if daemon_running and not desc:
+        desc.append("Daemon activo con conexiones potenciales")
+    if not desc:
+        desc.append("Sin sesiones activas")
+
     return {
         "ocupado": is_busy or daemon_running,
         "puede_conmutar": not is_busy,
         "motivo": "active_session" if (is_busy or daemon_running) else None,
-        "descripcion": f"{len(running_clients)} cliente(s) interactivo(s) activo(s)" if is_busy else ("Daemon activo con conexiones potenciales" if daemon_running else "Sin sesiones activas"),
+        "descripcion": " · ".join(desc),
         "perfil_activo": active_profile,
         "daemon_activo": daemon_running,
-        "procesos": running_clients
+        "procesos": running_clients,
+        "procesos_paralelos": parallel_busy
     }
 
 
@@ -1380,6 +1433,17 @@ def cmd_seleccionar_json(nombre: str, dry_run: bool = False, lock_timeout: int =
             "bloqueo_adquirido": False,
             "cambio_realizado": False,
             "procesos": running
+        }
+    parallel_busy = find_active_parallel_leases()
+    if parallel_busy:
+        return {
+            "solicitud": {"proveedor": "codex", "cuenta_destino": nombre, "dry_run": dry_run},
+            "permitido": False,
+            "codigo": "active_session",
+            "mensaje": f"No se puede conmutar: hay workers paralelos activos ({', '.join(parallel_busy)}).",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False,
+            "procesos_paralelos": parallel_busy
         }
     if dry_run:
         return {
@@ -1429,35 +1493,109 @@ def cmd_paralelo(nombre: str, extra_cmd: list[str]):
         print(f"❌ Error: La cuenta '{nombre}' no existe en {cuentas_dir}.", file=sys.stderr)
         sys.exit(1)
 
+    opaque_id = compute_opaque_identity(src)
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-    runtime_dir = codex_home / "runtimes" / nombre
+    runtimes_dir = codex_home / "runtimes"
+    runtimes_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    # 1. Alias lease lock
+    alias_lease_file = runtimes_dir / f"{nombre}.lease"
+    try:
+        alias_lease_fd = os.open(str(alias_lease_file), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(alias_lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(alias_lease_fd, 0)
+        os.write(alias_lease_fd, f"pid={os.getpid()}\nalias={nombre}\nstarted={int(time.time())}\n".encode())
+    except (BlockingIOError, OSError):
+        print(f"❌ Error [alias_lease_busy]: El alias '{nombre}' ya está en ejecución paralela activa (lease ocupado).", file=sys.stderr)
+        sys.exit(101)
+
+    # 2. Identity lease lock
+    id_lease_fd = None
+    if opaque_id:
+        id_lease_file = runtimes_dir / f".id_{opaque_id}.lease"
+        try:
+            id_lease_fd = os.open(str(id_lease_file), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(id_lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(id_lease_fd, 0)
+            os.write(id_lease_fd, f"pid={os.getpid()}\nalias={nombre}\nid={opaque_id}\nstarted={int(time.time())}\n".encode())
+        except (BlockingIOError, OSError):
+            try:
+                fcntl.flock(alias_lease_fd, fcntl.LOCK_UN)
+                os.close(alias_lease_fd)
+            except Exception:
+                pass
+            print(f"❌ Error [identity_collision]: La identidad real ('{opaque_id}') asociada al alias '{nombre}' ya está en ejecución paralela activa bajo otro alias.", file=sys.stderr)
+            sys.exit(102)
+
+    runtime_dir = runtimes_dir / nombre
     runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    isolated_auth = runtime_dir / "auth.json"
-    private_copy(src, isolated_auth)
-
-    isolated_env = os.environ.copy()
-    isolated_env["CODEX_HOME"] = str(runtime_dir)
-    isolated_env["CODEX_PROFILE"] = nombre
-
-    cmd_to_run = extra_cmd if extra_cmd else ["codex"]
     try:
-        res = subprocess.run(cmd_to_run, env=isolated_env)
-        ret = res.returncode
-    except FileNotFoundError:
-        print(f"❌ Error: No se encontró el ejecutable '{cmd_to_run[0]}'.", file=sys.stderr)
-        ret = 127
-    except KeyboardInterrupt:
-        ret = 130
+        isolated_auth = runtime_dir / "auth.json"
+        private_copy(src, isolated_auth)
 
-    if isolated_auth.is_file():
+        # Defensive copy de config.toml (NO enlace simbólico directo)
+        host_config = codex_home / "config.toml"
+        isolated_config = runtime_dir / "config.toml"
+        if host_config.is_file():
+            private_copy(host_config, isolated_config)
+
+        # Herencia segura de skills, rules, plugins, mcp
+        for folder_name in ("skills", "rules", "plugins", "mcp"):
+            host_folder = codex_home / folder_name
+            runtime_folder = runtime_dir / folder_name
+            if host_folder.is_dir() and not runtime_folder.exists():
+                try:
+                    os.symlink(host_folder, runtime_folder)
+                except Exception:
+                    pass
+
+        isolated_env = os.environ.copy()
+        isolated_env["CODEX_HOME"] = str(runtime_dir)
+        isolated_env["CODEX_PROFILE"] = nombre
+
+        cmd_to_run = extra_cmd if extra_cmd else ["codex"]
         try:
-            if isolated_auth.read_bytes() != src.read_bytes():
-                private_copy(isolated_auth, src)
+            res = subprocess.run(cmd_to_run, env=isolated_env)
+            ret = res.returncode
+        except FileNotFoundError:
+            print(f"❌ Error: No se encontró el ejecutable '{cmd_to_run[0]}'.", file=sys.stderr)
+            ret = 127
+        except KeyboardInterrupt:
+            ret = 130
+
+        if isolated_auth.is_file():
+            try:
+                if isolated_auth.read_bytes() != src.read_bytes():
+                    private_copy(isolated_auth, src)
+            except Exception as e:
+                recovery_name = f"recovery-{nombre}-{int(time.time())}.json"
+                recovery_path = runtimes_dir / recovery_name
+                try:
+                    private_copy(isolated_auth, recovery_path)
+                except Exception:
+                    try:
+                        recovery_path = Path(tempfile.gettempdir()) / recovery_name
+                        private_copy(isolated_auth, recovery_path)
+                    except Exception:
+                        pass
+                print(f"❌ Error [refresh_persistence_failed]: No se pudo actualizar el token refrescado en '{src}': {e}. Copia de respaldo guardada en '{recovery_path}'.", file=sys.stderr)
+                if ret == 0:
+                    ret = 103
+
+        sys.exit(ret)
+    finally:
+        if id_lease_fd is not None:
+            try:
+                fcntl.flock(id_lease_fd, fcntl.LOCK_UN)
+                os.close(id_lease_fd)
+            except Exception:
+                pass
+        try:
+            fcntl.flock(alias_lease_fd, fcntl.LOCK_UN)
+            os.close(alias_lease_fd)
         except Exception:
             pass
-
-    sys.exit(ret)
 
 
 def main():
@@ -1482,12 +1620,40 @@ def main():
             res = cmd_seleccionar_json(t, dry_run=dry_run)
             print(json.dumps(res, indent=2))
             sys.exit(0 if res.get("permitido") else 1)
+        elif args[0] in ("preflight", "capabilities", "capacidades"):
+            res = {
+                "protocol_version": 1,
+                "version": VERSION,
+                "proveedor": "codex",
+                "capabilities": {
+                    "parallel": True,
+                    "identity_reservation": True,
+                    "active_session_detection": True,
+                    "refresh_persistence_errors": True
+                }
+            }
+            print(json.dumps(res, indent=2))
+            sys.exit(0)
 
     if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
         target = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         cmd_status(target)
     elif args[0] in ("version", "--version", "-v", "-V"):
         cmd_version()
+    elif args[0] in ("preflight", "capabilities", "capacidades"):
+        res = {
+            "protocol_version": 1,
+            "version": VERSION,
+            "proveedor": "codex",
+            "capabilities": {
+                "parallel": True,
+                "identity_reservation": True,
+                "active_session_detection": True,
+                "refresh_persistence_errors": True
+            }
+        }
+        print(json.dumps(res, indent=2))
+        sys.exit(0)
     elif args[0] in ("actualizar", "update", "upgrade"):
         cmd_actualizar(args[1:])
     elif args[0] in ("listar", "list", "ls"):

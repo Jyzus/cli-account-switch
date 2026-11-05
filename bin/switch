@@ -355,6 +355,50 @@ def cmd_ocupacion_json(provider_filter: str = ""):
     }
 
 
+def cmd_preflight_json() -> dict:
+    codex_tool = find_tool("codex-switch")
+    agy_tool = find_tool("agy-switch")
+
+    codex_avail = codex_tool is not None
+    agy_avail = agy_tool is not None
+
+    return {
+        "protocol_version": 1,
+        "version": VERSION,
+        "capabilities": {
+            "parallel_codex": codex_avail,
+            "parallel_agy": agy_avail,
+            "identity_reservation": True,
+            "active_session_detection": True,
+            "refresh_persistence_errors": True
+        },
+        "proveedores": {
+            "agy": {
+                "soportado": agy_avail,
+                "parallel": agy_avail,
+                "active_session_detection": True,
+                "identity_reservation": True,
+                "refresh_persistence_errors": True
+            },
+            "codex": {
+                "soportado": codex_avail,
+                "parallel": codex_avail,
+                "active_session_detection": True,
+                "identity_reservation": True,
+                "refresh_persistence_errors": True
+            },
+            "opencode": {
+                "soportado": False,
+                "parallel": False,
+                "active_session_detection": False,
+                "identity_reservation": False,
+                "refresh_persistence_errors": False,
+                "razon": "adaptador_no_implementado"
+            }
+        }
+    }
+
+
 def cmd_seleccionar_json(prov: str, cuenta: str, dry_run: bool = False):
     prov = prov.lower()
     if prov in ("opencode",):
@@ -449,10 +493,16 @@ def main():
             res = cmd_seleccionar_json(prov, cuenta, dry_run=dry_run)
             print(json.dumps(res, indent=2))
             sys.exit(0 if res.get("permitido") else 1)
+        elif args[0] in ("preflight", "capabilities", "capacidades"):
+            print(json.dumps(cmd_preflight_json(), indent=2))
+            sys.exit(0)
 
     if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
         target = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         cmd_status(target)
+    elif args[0] in ("preflight", "capabilities", "capacidades"):
+        print(json.dumps(cmd_preflight_json(), indent=2))
+        sys.exit(0)
     elif args[0] in ("cuentas", "accounts"):
         print(json.dumps(cmd_cuentas_json(), indent=2))
     elif args[0] in ("cuota", "quota"):
