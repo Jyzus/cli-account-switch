@@ -330,6 +330,18 @@ git pull --ff-only
 
 Para desinstalar, elimina `switch`, `codex-switch`, `agy-switch`, `switch-widget` y `switch-tray` del directorio de instalación (`~/.local/bin`). Tus perfiles e historiales permanecen en sus directorios de configuración.
 
+## Integración de Nuevos Agentes y Proveedores (DeepSeek, OpenCode, etc.)
+
+Switch está diseñado para ser extensible. Si estás integrando un nuevo asistente o CLI de IA (por ejemplo `deepseek`, `opencode`, o modelos personalizados):
+
+- **Guía Completa para Modelos y Desarrolladores**: Consulta [INTEGRACION_AGENTES.md](INTEGRACION_AGENTES.md).
+- **Plantilla Base Lista para Usar**: [templates/provider_switch_template.py](templates/provider_switch_template.py).
+
+Puedes iniciar un agente de IA en este repositorio e indicarle:
+> *"Lee `INTEGRACION_AGENTES.md` para integrar `<tu-proveedor>` dentro de Switch"*
+
+El documento contiene la auditoría de auto-descubrimiento, el contrato JSON headless (`--json`), la gestión de concurrencia aislada (`paralelo`), la auto-sincronización tras expiración y la lista de verificación (DoD).
+
 ## Contribuciones
 
 Las mejoras y correcciones son bienvenidas mediante issues y pull requests. No adjuntes tokens, credenciales ni archivos de autenticación a los reportes.
