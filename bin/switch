@@ -583,6 +583,43 @@ def main():
         else:
             print("Uso: switch codex guardar <nombre>  o  switch agy guardar <nombre>")
             sys.exit(1)
+    elif args[0] in ("reautenticar", "reauth", "login"):
+        positionals = [a for a in args[1:] if not a.startswith("-")]
+        options = [a for a in args[1:] if a.startswith("-")]
+        prov = ""
+        nombre = ""
+        if positionals:
+            if positionals[0] in ("codex", "openai", "agy", "antigravity", "gemini"):
+                prov = positionals[0]
+                if len(positionals) > 1:
+                    nombre = positionals[1]
+            else:
+                nombre = positionals[0]
+
+        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        agy_home = Path.home() / ".gemini" / "antigravity-cli"
+
+        if prov in ("codex", "openai"):
+            exec_subcommand("codex-switch", ["reautenticar", nombre] + options if nombre else ["reautenticar"] + options)
+        elif prov in ("agy", "antigravity", "gemini"):
+            exec_subcommand("agy-switch", ["reautenticar", nombre] + options if nombre else ["reautenticar"] + options)
+        elif nombre:
+            in_codex = (codex_home / "cuentas" / f"{nombre}.json").is_file()
+            in_agy = (agy_home / "cuentas" / f"{nombre}.token").is_file()
+            if in_codex and not in_agy:
+                exec_subcommand("codex-switch", ["reautenticar", nombre] + options)
+            elif in_agy and not in_codex:
+                exec_subcommand("agy-switch", ["reautenticar", nombre] + options)
+            elif in_codex and in_agy:
+                print(f"El perfil '{nombre}' existe tanto en Codex como en AGY.")
+                print(f"Especifica la herramienta con: switch codex reautenticar {nombre}  o  switch agy reautenticar {nombre}")
+                sys.exit(1)
+            else:
+                print(f"❌ Error: El perfil '{nombre}' no existe en cuentas de Codex ni de AGY.")
+                sys.exit(1)
+        else:
+            print("Uso: switch reautenticar [codex|agy] <nombre>")
+            sys.exit(1)
     elif args[0] in ("usar", "use"):
         # Buscar en cuál herramienta existe el perfil
         alias = args[1] if len(args) > 1 and not args[1].startswith("-") else ""

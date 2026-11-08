@@ -210,22 +210,20 @@ def clear_token_from_keyring() -> bool:
 
 
 def ensure_active_token_on_disk() -> bool:
-    """Verifica si el token activo existe en disco. Si no existe, intenta extraerlo del Keyring del sistema."""
+    """Verifica si el token activo en Keyring difiere del archivo en disco o si falta en disco."""
     token_path = get_token_path(auto_sync=False)
-    if token_path.is_file() and token_path.stat().st_size > 10:
-        return True
-
     raw_token = extract_token_from_keyring()
     if raw_token:
         try:
             json.loads(raw_token)
-            token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            token_path.write_text(raw_token, encoding="utf-8")
-            token_path.chmod(0o600)
-            return True
+            if not token_path.is_file() or token_path.stat().st_size <= 10 or token_path.read_text(encoding="utf-8").strip() != raw_token.strip():
+                token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                token_path.write_text(raw_token, encoding="utf-8")
+                token_path.chmod(0o600)
+                return True
         except Exception:
             pass
-    return False
+    return token_path.is_file() and token_path.stat().st_size > 10
 
 
 def get_base_dir() -> Path:
@@ -318,6 +316,80 @@ def get_most_recent_conversation_id() -> str:
     dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
     return dirs[0].name
 
+def get_active_profile_marker() -> Path:
+    return get_cuentas_dir() / ".active_profile"
+
+def get_recorded_active_profile() -> str:
+    marker = get_active_profile_marker()
+    if marker.is_file():
+        try:
+            val = marker.read_text(encoding="utf-8").strip()
+            if val and (get_cuentas_dir() / f"{val}.token").is_file():
+                return val
+        except Exception:
+            pass
+    return ""
+
+def set_recorded_active_profile(nombre: str):
+    if not nombre or nombre.startswith("("):
+        return
+    marker = get_active_profile_marker()
+    try:
+        marker.write_text(nombre.strip() + "\n", encoding="utf-8")
+        marker.chmod(0o600)
+    except Exception:
+        pass
+
+def clear_recorded_active_profile():
+    marker = get_active_profile_marker()
+    if marker.is_file():
+        try:
+            marker.unlink()
+        except Exception:
+            pass
+
+def sync_active_profile() -> str:
+    """Sincroniza automáticamente antigravity-oauth-token y Keyring con el perfil guardado en cuentas/."""
+    ensure_active_token_on_disk()
+    token_path = get_token_path(auto_sync=False)
+    if not token_path.is_file() or token_path.stat().st_size <= 10:
+        return ""
+    try:
+        token_bytes = token_path.read_bytes()
+        token_data = json.loads(token_bytes)
+        tok = token_data.get("token") if isinstance(token_data.get("token"), dict) else token_data
+        has_creds = bool(tok.get("access_token") or tok.get("refresh_token") or token_data.get("id_token_email"))
+        if not has_creds:
+            return ""
+    except Exception:
+        return ""
+
+    cuentas_dir = get_cuentas_dir()
+    recorded = get_recorded_active_profile()
+
+    target = recorded
+    if not target or not (cuentas_dir / f"{target}.token").is_file():
+        deduced = find_active_profile_name(cuentas_dir, token_path)
+        if deduced and not deduced.startswith("("):
+            target = deduced
+            set_recorded_active_profile(target)
+
+    if not target or not (cuentas_dir / f"{target}.token").is_file():
+        return ""
+
+    target_file = cuentas_dir / f"{target}.token"
+    try:
+        if target_file.read_bytes() != token_bytes:
+            private_copy(token_path, target_file)
+            try:
+                sync_token_to_keyring(token_bytes.decode("utf-8"))
+            except Exception:
+                pass
+            return target
+    except Exception:
+        pass
+    return target
+
 def find_active_profile_name(cuentas_dir: Path, token_path: Path) -> str:
     if not token_path.is_file():
         return "(ninguna)"
@@ -326,10 +398,23 @@ def find_active_profile_name(cuentas_dir: Path, token_path: Path) -> str:
     except Exception:
         return "(desconocido)"
 
+    rec = get_recorded_active_profile()
+    if rec and (cuentas_dir / f"{rec}.token").is_file():
+        try:
+            if (cuentas_dir / f"{rec}.token").read_bytes() == current_bytes:
+                return rec
+        except Exception:
+            pass
+        active_key = extract_account_key(token_path)
+        rec_key = extract_account_key(cuentas_dir / f"{rec}.token")
+        if active_key and rec_key and active_key == rec_key:
+            return rec
+
     # 1. Búsqueda exacta por contenido
     for f in sorted(cuentas_dir.glob("*.token")):
         try:
             if f.read_bytes() == current_bytes:
+                set_recorded_active_profile(f.stem)
                 return f.stem
         except Exception:
             continue
@@ -343,6 +428,9 @@ def find_active_profile_name(cuentas_dir: Path, token_path: Path) -> str:
                     return f.stem
             except Exception:
                 continue
+
+    if rec and (cuentas_dir / f"{rec}.token").is_file():
+        return rec
 
     return "(sin guardar / temporal)"
 
@@ -521,6 +609,7 @@ def fetch_agy_quota(profile_path: Path, active_profile: str = "") -> dict:
 
 
 def cmd_listar():
+    sync_active_profile()
     token_path = get_token_path()
     cuentas_dir = get_cuentas_dir()
     email = decode_email_from_token(token_path)
@@ -549,6 +638,7 @@ def cmd_listar():
 
 
 def cmd_status(target: str = ""):
+    sync_active_profile()
     token_path = get_token_path()
     cuentas_dir = get_cuentas_dir()
     email = decode_email_from_token(token_path)
@@ -724,6 +814,7 @@ def cmd_guardar(nombre: str, force: bool = False):
 
     is_update = dest.is_file()
     private_copy(token_path, dest)
+    set_recorded_active_profile(nombre)
     action_text = "actualizada" if is_update else "guardada"
     print(f"✅ Cuenta {action_text} con éxito:")
     print(f"   Perfil : \033[1;36m{nombre}\033[0m")
@@ -920,6 +1011,8 @@ def cmd_eliminar(nombre: str):
     is_active = (find_active_profile_name(cuentas_dir, token_path) == nombre)
 
     target.unlink()
+    if get_recorded_active_profile() == nombre:
+        clear_recorded_active_profile()
     print(f"🗑️  Perfil '\033[1;36m{nombre}\033[0m' ({email}) eliminado con éxito.")
     if is_active:
         print("   ℹ️  Nota: Este perfil era el que estaba activo en tu sesión actual.")
@@ -953,6 +1046,8 @@ def cmd_renombrar(actual: str, nuevo: str):
         sys.exit(1)
 
     src.rename(dst)
+    if get_recorded_active_profile() == actual:
+        set_recorded_active_profile(nuevo)
     email = decode_email_from_token(dst)
     print(f"✏️  Perfil renombrado con éxito:")
     print(f"   '\033[1;36m{actual}\033[0m' → '\033[1;32m{nuevo}\033[0m' ({email})")
@@ -1117,7 +1212,19 @@ def cmd_usar(nombre: str, force: bool = False):
     if running_clients and force:
         print(f"\n⚠️  Advertencia: Forzando cambio de cuenta (--force) con {len(running_clients)} proceso(s) activo(s)...", flush=True)
 
+    # Sincronizar credenciales salientes antes de conmutar para no perder tokens frescos o logins
+    prev_active = get_recorded_active_profile() or active_profile
+    if prev_active and not prev_active.startswith("(") and prev_active != nombre:
+        prev_file = cuentas_dir / f"{prev_active}.token"
+        if prev_file.is_file() and token_path.is_file() and token_path.stat().st_size > 10:
+            try:
+                if prev_file.read_bytes() != token_path.read_bytes():
+                    private_copy(token_path, prev_file)
+            except Exception:
+                pass
+
     private_copy(src, token_path)
+    set_recorded_active_profile(nombre)
     # Sincronizar también con GNOME Keyring si está disponible
     try:
         raw_tok = token_path.read_text(encoding="utf-8")
@@ -1132,6 +1239,12 @@ def cmd_usar(nombre: str, force: bool = False):
     if last_cid:
         print(f"\n   Puedes reanudar tu tarea interrumpida con:")
         print(f"   \033[1;33magy -c\033[0m   o   \033[1;33magy --conversation {last_cid}\033[0m\n")
+
+    q = fetch_agy_quota(src, active_profile=nombre)
+    if q.get("expired"):
+        print(f"\n⚠️  Aviso: El token de '\033[1;36m{nombre}\033[0m' está expirado.")
+        print("   • Al abrir Antigravity o ejecutar \033[1;32magy-switch reautenticar\033[0m, se iniciará el flujo de autenticación.")
+        print("   • Switch guardará y registrará automáticamente la nueva sesión en este perfil para que no tengas que volver a iniciarla.\n")
 
 
 def cmd_nueva(nombre: str, force: bool = False, aislada: bool = False):
@@ -1206,6 +1319,7 @@ def cmd_nueva(nombre: str, force: bool = False, aislada: bool = False):
         if token_path.is_file() and token_path.stat().st_size > 10:
             dest = cuentas_dir / f"{nombre}.token"
             private_copy(token_path, dest)
+            set_recorded_active_profile(nombre)
             email = decode_email_from_token(dest)
             try:
                 raw_tok = token_path.read_text(encoding="utf-8")
@@ -1221,6 +1335,57 @@ def cmd_nueva(nombre: str, force: bool = False, aislada: bool = False):
                 shutil.move(temp_backup, token_path)
             if keyring_backup:
                 sync_token_to_keyring(keyring_backup)
+
+
+def cmd_reautenticar(nombre: str = ""):
+    """Reautentica una cuenta expirada y guarda automáticamente el nuevo token en el perfil."""
+    cuentas_dir = get_cuentas_dir()
+    token_path = get_token_path(auto_sync=False)
+    if not nombre:
+        nombre = get_recorded_active_profile() or find_active_profile_name(cuentas_dir, token_path)
+        if not nombre or nombre.startswith("("):
+            print("❌ Especifica el nombre de la cuenta a reautenticar (ej: agy-switch reautenticar cuenta1)")
+            sys.exit(1)
+    validate_alias(nombre)
+    src = cuentas_dir / f"{nombre}.token"
+    if not src.is_file():
+        print(f"❌ La cuenta '{nombre}' no existe en {cuentas_dir}.")
+        sys.exit(1)
+
+    print(f"\n🔄 Preparando reautenticación para '\033[1;36m{nombre}\033[0m'...")
+    set_recorded_active_profile(nombre)
+
+    temp_backup = get_base_dir() / "antigravity-oauth-token.bak"
+    if token_path.is_file():
+        shutil.move(token_path, temp_backup)
+    keyring_backup = extract_token_from_keyring()
+    if keyring_backup:
+        clear_token_from_keyring()
+
+    print("   Se abrirá 'agy'. Completa el flujo de autenticación OAuth en tu navegador.")
+    print("   Una vez que cargue la interfaz, sal con Ctrl+D o /exit.\n")
+    try:
+        subprocess.run(["agy"], check=False)
+    finally:
+        ensure_active_token_on_disk()
+        if token_path.is_file() and token_path.stat().st_size > 10:
+            private_copy(token_path, src)
+            set_recorded_active_profile(nombre)
+            email = decode_email_from_token(src)
+            try:
+                sync_token_to_keyring(token_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            print(f"\n✅ Cuenta '\033[1;36m{nombre}\033[0m' ({email}) reautenticada y guardada con éxito en disco!")
+            if temp_backup.is_file():
+                temp_backup.unlink()
+        else:
+            print("\n⚠️ No se detectó inicio de sesión completado. Restaurando credencial previa...")
+            if temp_backup.is_file():
+                shutil.move(temp_backup, token_path)
+            if keyring_backup:
+                sync_token_to_keyring(keyring_backup)
+            sys.exit(1)
 
 def cmd_continuar(args: list[str]):
     ensure_active_token_on_disk()
@@ -1433,6 +1598,7 @@ def release_file_lock(fd):
 
 
 def cmd_cuentas_json() -> dict:
+    sync_active_profile()
     token_path = get_token_path(auto_sync=False)
     cuentas_dir = get_cuentas_dir()
     active_profile = find_active_profile_name(cuentas_dir, token_path) if token_path.is_file() else ""
@@ -1464,6 +1630,7 @@ def cmd_cuentas_json() -> dict:
 
 
 def cmd_cuota_json(target: str = "") -> dict:
+    sync_active_profile()
     token_path = get_token_path(auto_sync=False)
     cuentas_dir = get_cuentas_dir()
     active_profile = find_active_profile_name(cuentas_dir, token_path) if token_path.is_file() else ""
@@ -1556,6 +1723,7 @@ def find_active_parallel_leases() -> list[str]:
 
 
 def cmd_ocupacion_json() -> dict:
+    sync_active_profile()
     running_clients = find_running_clients("agy")
     parallel_busy = find_active_parallel_leases()
     token_path = get_token_path(auto_sync=False)
@@ -1639,7 +1807,17 @@ def cmd_seleccionar_json(nombre: str, dry_run: bool = False, lock_timeout: int =
     try:
         token_path = get_token_path(auto_sync=False)
         active_before = find_active_profile_name(cuentas_dir, token_path)
+        prev_active = get_recorded_active_profile() or active_before
+        if prev_active and not prev_active.startswith("(") and prev_active != nombre:
+            prev_file = cuentas_dir / f"{prev_active}.token"
+            if prev_file.is_file() and token_path.is_file() and token_path.stat().st_size > 10:
+                try:
+                    if prev_file.read_bytes() != token_path.read_bytes():
+                        private_copy(token_path, prev_file)
+                except Exception:
+                    pass
         private_copy(src, token_path)
+        set_recorded_active_profile(nombre)
         try:
             raw_tok = token_path.read_text(encoding="utf-8")
             if not sync_token_to_keyring(raw_tok):
@@ -1781,6 +1959,7 @@ def cmd_paralelo(nombre: str, extra_cmd: list[str]):
 
 
 def main():
+    sync_active_profile()
     args = sys.argv[1:]
     if "--json" in args:
         if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
@@ -1859,6 +2038,9 @@ def main():
         nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         force = any(a in ("--force", "-f") for a in args[1:])
         cmd_usar(nombre, force=force)
+    elif args[0] in ("reautenticar", "reauth"):
+        nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        cmd_reautenticar(nombre)
     elif args[0] in ("agregar", "add"):
         i = 1
         desde = ""
@@ -1890,6 +2072,9 @@ def main():
         options = [a for a in args[1:] if a != nombre]
         force = any(a in ("--force", "-f") for a in options)
         aislada = any(a in ("--aislada", "--no-switch", "--isolated") for a in options)
+        if nombre and (get_cuentas_dir() / f"{nombre}.token").is_file() and args[0] == "login":
+            cmd_reautenticar(nombre)
+            sys.exit(0)
         unknown = [option for option in options if option not in ("--force", "-f", "--aislada", "--no-switch", "--isolated")]
         if unknown:
             print(f"Opción no reconocida para nueva cuenta: {unknown[0]}")

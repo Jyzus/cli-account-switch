@@ -141,6 +141,75 @@ def get_most_recent_session_id() -> str:
     except Exception:
         return ""
 
+def get_active_profile_marker() -> Path:
+    return get_cuentas_dir() / ".active_profile"
+
+def get_recorded_active_profile() -> str:
+    marker = get_active_profile_marker()
+    if marker.is_file():
+        try:
+            val = marker.read_text(encoding="utf-8").strip()
+            if val and (get_cuentas_dir() / f"{val}.json").is_file():
+                return val
+        except Exception:
+            pass
+    return ""
+
+def set_recorded_active_profile(nombre: str):
+    if not nombre or nombre.startswith("("):
+        return
+    marker = get_active_profile_marker()
+    try:
+        marker.write_text(nombre.strip() + "\n", encoding="utf-8")
+        marker.chmod(0o600)
+    except Exception:
+        pass
+
+def clear_recorded_active_profile():
+    marker = get_active_profile_marker()
+    if marker.is_file():
+        try:
+            marker.unlink()
+        except Exception:
+            pass
+
+def sync_active_profile() -> str:
+    """Sincroniza automáticamente auth.json con el perfil guardado en cuentas/ si fue actualizado o reautenticado."""
+    auth_path = get_auth_path()
+    if not auth_path.is_file() or auth_path.stat().st_size <= 20:
+        return ""
+    try:
+        auth_bytes = auth_path.read_bytes()
+        auth_data = json.loads(auth_bytes)
+        tokens = auth_data.get("tokens", {})
+        has_creds = bool(auth_data.get("OPENAI_API_KEY") or tokens.get("access_token") or tokens.get("refresh_token"))
+        if not has_creds:
+            return ""
+    except Exception:
+        return ""
+
+    cuentas_dir = get_cuentas_dir()
+    recorded = get_recorded_active_profile()
+
+    target = recorded
+    if not target or not (cuentas_dir / f"{target}.json").is_file():
+        deduced = find_active_profile_name(cuentas_dir, auth_path)
+        if deduced and not deduced.startswith("("):
+            target = deduced
+            set_recorded_active_profile(target)
+
+    if not target or not (cuentas_dir / f"{target}.json").is_file():
+        return ""
+
+    target_file = cuentas_dir / f"{target}.json"
+    try:
+        if target_file.read_bytes() != auth_bytes:
+            private_copy(auth_path, target_file)
+            return target
+    except Exception:
+        pass
+    return target
+
 def find_active_profile_name(cuentas_dir: Path, auth_path: Path) -> str:
     if not auth_path.is_file():
         return "(ninguna)"
@@ -149,10 +218,23 @@ def find_active_profile_name(cuentas_dir: Path, auth_path: Path) -> str:
     except Exception:
         return "(desconocido)"
 
+    rec = get_recorded_active_profile()
+    if rec and (cuentas_dir / f"{rec}.json").is_file():
+        try:
+            if (cuentas_dir / f"{rec}.json").read_bytes() == current_bytes:
+                return rec
+        except Exception:
+            pass
+        active_key = extract_account_key(auth_path)
+        rec_key = extract_account_key(cuentas_dir / f"{rec}.json")
+        if active_key and rec_key and active_key == rec_key:
+            return rec
+
     # 1. Búsqueda exacta por contenido
     for f in sorted(cuentas_dir.glob("*.json")):
         try:
             if f.read_bytes() == current_bytes:
+                set_recorded_active_profile(f.stem)
                 return f.stem
         except Exception:
             continue
@@ -166,6 +248,10 @@ def find_active_profile_name(cuentas_dir: Path, auth_path: Path) -> str:
                     return f.stem
             except Exception:
                 continue
+
+    # Si hay un perfil activo registrado y auth_path contiene credenciales
+    if rec and (cuentas_dir / f"{rec}.json").is_file():
+        return rec
 
     return "(sin guardar / temporal)"
 
@@ -288,6 +374,7 @@ def fetch_codex_quota(profile_path: Path, active_profile: str = "") -> dict:
 
 
 def cmd_listar():
+    sync_active_profile()
     auth_path = get_auth_path()
     cuentas_dir = get_cuentas_dir()
     account_info = decode_account_from_auth(auth_path)
@@ -317,6 +404,7 @@ def cmd_listar():
 
 
 def cmd_status(target: str = ""):
+    sync_active_profile()
     auth_path = get_auth_path()
     cuentas_dir = get_cuentas_dir()
     account_info = decode_account_from_auth(auth_path)
@@ -487,6 +575,7 @@ def cmd_guardar(nombre: str, force: bool = False):
 
     is_update = dest.is_file()
     private_copy(auth_path, dest)
+    set_recorded_active_profile(nombre)
     action_text = "actualizada" if is_update else "guardada"
     print(f"✅ Cuenta {action_text} con éxito:")
     print(f"   Perfil : \033[1;36m{nombre}\033[0m")
@@ -657,6 +746,8 @@ def cmd_eliminar(nombre: str):
     is_active = (find_active_profile_name(cuentas_dir, auth_path) == nombre)
 
     target.unlink()
+    if get_recorded_active_profile() == nombre:
+        clear_recorded_active_profile()
     print(f"🗑️  Perfil '\033[1;36m{nombre}\033[0m' ({account_info}) eliminado con éxito.")
     if is_active:
         print("   ℹ️  Nota: Este perfil era el que estaba activo en tu sesión actual.")
@@ -690,6 +781,8 @@ def cmd_renombrar(actual: str, nuevo: str):
         sys.exit(1)
 
     src.rename(dst)
+    if get_recorded_active_profile() == actual:
+        set_recorded_active_profile(nuevo)
     account_info = decode_account_from_auth(dst)
     print(f"✏️  Perfil renombrado con éxito:")
     print(f"   '\033[1;36m{actual}\033[0m' → '\033[1;32m{nuevo}\033[0m' ({account_info})")
@@ -904,6 +997,17 @@ def cmd_usar(nombre: str, force: bool = False):
     if running_clients and force:
         print(f"\n⚠️  Advertencia: Forzando cambio de cuenta (--force) con {len(running_clients)} proceso(s) activo(s)...", flush=True)
 
+    # Sincronizar credenciales salientes antes de conmutar para no perder tokens frescos o logins
+    prev_active = get_recorded_active_profile() or active_profile
+    if prev_active and not prev_active.startswith("(") and prev_active != nombre:
+        prev_file = cuentas_dir / f"{prev_active}.json"
+        if prev_file.is_file() and auth_path.is_file() and auth_path.stat().st_size > 20:
+            try:
+                if prev_file.read_bytes() != auth_path.read_bytes():
+                    private_copy(auth_path, prev_file)
+            except Exception:
+                pass
+
     try:
         selected = src.read_bytes()
         data = json.loads(selected)
@@ -928,6 +1032,7 @@ def cmd_usar(nombre: str, force: bool = False):
             sys.exit(1)
     try:
         write_auth_atomic(auth_path, selected)
+        set_recorded_active_profile(nombre)
     except OSError:
         print("❌ No se pudieron instalar las credenciales seleccionadas.")
         if running:
@@ -945,6 +1050,12 @@ def cmd_usar(nombre: str, force: bool = False):
         print("   Reconecta la aplicación para continuar la conversación.")
     print("   Si tienes una CLI independiente abierta, ciérrala y reanúdala:")
     print("   codex-switch continuar")
+
+    q = fetch_codex_quota(src, active_profile=nombre)
+    if q.get("expired"):
+        print(f"\n⚠️  Aviso: La sesión de '\033[1;36m{nombre}\033[0m' está expirada.")
+        print("   • Al usar Codex o ejecutar \033[1;32mcodex-switch reautenticar\033[0m, se te pedirá iniciar sesión.")
+        print("   • Switch guardará y registrará automáticamente la nueva sesión en este perfil para que no tengas que volver a iniciarla.\n")
 
 
 def cmd_nueva(nombre: str, device_auth: bool = False, force: bool = False, aislada: bool = False):
@@ -1010,6 +1121,7 @@ def cmd_nueva(nombre: str, device_auth: bool = False, force: bool = False, aisla
         if result.returncode == 0 and auth_path.is_file():
             dest = cuentas_dir / f"{nombre}.json"
             private_copy(auth_path, dest)
+            set_recorded_active_profile(nombre)
             account_info = decode_account_from_auth(dest)
             print(f"\n✅ Nueva cuenta registrada y guardada como '\033[1;36m{nombre}\033[0m' ({account_info})!")
             if temp_backup.is_file():
@@ -1023,6 +1135,49 @@ def cmd_nueva(nombre: str, device_auth: bool = False, force: bool = False, aisla
         print("\n❌ No se encontró el ejecutable 'codex'. Restaurando credencial anterior...")
         if temp_backup.is_file():
             shutil.move(temp_backup, auth_path)
+        sys.exit(127)
+
+
+def cmd_reautenticar(nombre: str = "", device_auth: bool = False):
+    """Reautentica una cuenta expirada y guarda automáticamente las nuevas credenciales en el perfil."""
+    cuentas_dir = get_cuentas_dir()
+    auth_path = get_auth_path()
+    if not nombre:
+        nombre = get_recorded_active_profile() or find_active_profile_name(cuentas_dir, auth_path)
+        if not nombre or nombre.startswith("("):
+            print("❌ Especifica el nombre de la cuenta a reautenticar (ej: codex-switch reautenticar cuenta1)")
+            sys.exit(1)
+    validate_alias(nombre)
+    src = cuentas_dir / f"{nombre}.json"
+    if not src.is_file():
+        print(f"❌ La cuenta '{nombre}' no existe en {cuentas_dir}.")
+        sys.exit(1)
+
+    print(f"\n🔄 Preparando reautenticación para '\033[1;36m{nombre}\033[0m'...")
+    set_recorded_active_profile(nombre)
+
+    running_daemon = daemon_is_running()
+    if running_daemon:
+        run_daemon_action("stop")
+
+    login_cmd = ["codex", "login"]
+    if device_auth:
+        login_cmd.append("--device-auth")
+
+    try:
+        res = subprocess.run(login_cmd, check=False)
+        if res.returncode == 0 and auth_path.is_file() and auth_path.stat().st_size > 20:
+            private_copy(auth_path, src)
+            set_recorded_active_profile(nombre)
+            account_info = decode_account_from_auth(src)
+            print(f"\n✅ Cuenta '\033[1;36m{nombre}\033[0m' ({account_info}) reautenticada y guardada con éxito en disco!")
+            if running_daemon:
+                run_daemon_action("restart")
+        else:
+            print("\n⚠️ No se completó la reautenticación. Se conservaron las credenciales previas.")
+            sys.exit(res.returncode or 1)
+    except FileNotFoundError:
+        print("\n❌ No se encontró el ejecutable 'codex'.")
         sys.exit(127)
 
 def cmd_continuar(args: list[str]):
@@ -1228,6 +1383,7 @@ def release_file_lock(fd):
 
 
 def cmd_cuentas_json() -> dict:
+    sync_active_profile()
     auth_path = get_auth_path()
     cuentas_dir = get_cuentas_dir()
     active_profile = find_active_profile_name(cuentas_dir, auth_path) if auth_path.is_file() else ""
@@ -1259,6 +1415,7 @@ def cmd_cuentas_json() -> dict:
 
 
 def cmd_cuota_json(target: str = "") -> dict:
+    sync_active_profile()
     auth_path = get_auth_path()
     cuentas_dir = get_cuentas_dir()
     active_profile = find_active_profile_name(cuentas_dir, auth_path) if auth_path.is_file() else ""
@@ -1381,6 +1538,7 @@ def find_active_parallel_leases() -> list[str]:
 
 
 def cmd_ocupacion_json() -> dict:
+    sync_active_profile()
     running_clients = find_running_clients("codex")
     parallel_busy = find_active_parallel_leases()
     auth_path = get_auth_path()
@@ -1469,8 +1627,18 @@ def cmd_seleccionar_json(nombre: str, dry_run: bool = False, lock_timeout: int =
     try:
         auth_path = get_auth_path()
         active_before = find_active_profile_name(cuentas_dir, auth_path)
+        prev_active = get_recorded_active_profile() or active_before
+        if prev_active and not prev_active.startswith("(") and prev_active != nombre:
+            prev_file = cuentas_dir / f"{prev_active}.json"
+            if prev_file.is_file() and auth_path.is_file() and auth_path.stat().st_size > 20:
+                try:
+                    if prev_file.read_bytes() != auth_path.read_bytes():
+                        private_copy(auth_path, prev_file)
+                except Exception:
+                    pass
         selected = src.read_bytes()
         write_auth_atomic(auth_path, selected)
+        set_recorded_active_profile(nombre)
         return {
             "solicitud": {"proveedor": "codex", "cuenta_destino": nombre, "dry_run": False},
             "permitido": True,
@@ -1599,6 +1767,7 @@ def cmd_paralelo(nombre: str, extra_cmd: list[str]):
 
 
 def main():
+    sync_active_profile()
     args = sys.argv[1:]
     if "--json" in args:
         if not args or args[0] in ("status", "estado", "-s", "tokens", "token", "cuota", "quota", "usage", "saldo"):
@@ -1673,6 +1842,10 @@ def main():
         nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
         force = any(a in ("--force", "-f") for a in args[1:])
         cmd_usar(nombre, force=force)
+    elif args[0] in ("reautenticar", "reauth"):
+        nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        device_auth = "--device-auth" in args[1:]
+        cmd_reautenticar(nombre, device_auth=device_auth)
     elif args[0] in ("agregar", "add"):
         i = 1
         desde = ""
@@ -1708,6 +1881,9 @@ def main():
         device_auth = "--device-auth" in options
         force = any(a in ("--force", "-f") for a in options)
         aislada = any(a in ("--aislada", "--no-switch", "--isolated") for a in options)
+        if nombre and (get_cuentas_dir() / f"{nombre}.json").is_file() and args[0] == "login":
+            cmd_reautenticar(nombre, device_auth=device_auth)
+            sys.exit(0)
         unknown = [option for option in options if option not in ("--device-auth", "--force", "-f", "--aislada", "--no-switch", "--isolated")]
         if unknown:
             print(f"Opción no reconocida para nueva cuenta: {unknown[0]}")

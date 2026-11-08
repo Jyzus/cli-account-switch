@@ -116,7 +116,10 @@ class CodexProvider(BaseProvider):
         active_profile = CODEX_MOD.find_active_profile_name(cuentas_dir, auth_path)
         active_email = CODEX_MOD.decode_account_from_auth(auth_path)
 
-        guardadas = sorted(cuentas_dir.glob("*.json"))
+        guardadas = sorted(
+            cuentas_dir.glob("*.json"),
+            key=lambda p: (0 if p.stem == active_profile else 1, p.stem.lower()),
+        )
         now_ts = int(time.time())
 
         def check_profile(p: Path) -> dict:
@@ -184,6 +187,12 @@ class CodexProvider(BaseProvider):
 
         with ThreadPoolExecutor(max_workers=min(len(guardadas), 8) or 1) as pool:
             accounts = list(pool.map(check_profile, guardadas))
+
+        if not accounts and auth_path.is_file():
+            acc = check_profile(auth_path)
+            acc["name"] = "(activa sin guardar)"
+            acc["is_active"] = True
+            accounts = [acc]
 
         return {
             "id": self.id,

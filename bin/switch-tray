@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -219,6 +220,7 @@ def fetch_tray_status() -> dict:
             "reset_str": "",
             "error": None,
             "all_accounts": [],
+            "accounts": [],
         },
         "agy": {
             "active_name": "",
@@ -228,10 +230,11 @@ def fetch_tray_status() -> dict:
             "reset_str": "",
             "error": None,
             "all_accounts": [],
+            "accounts": [],
         },
     }
 
-    # 1. Codex Quota
+    # 1. Codex Quotas (Top 3 cuentas, activa primero)
     if codex_mod:
         try:
             auth_path = codex_mod.get_auth_path()
@@ -240,34 +243,69 @@ def fetch_tray_status() -> dict:
             status["codex"]["active_name"] = active_name or "sin guardar"
             status["codex"]["active_email"] = codex_mod.decode_account_from_auth(auth_path)
 
-            all_files = sorted(cuentas_dir.glob("*.json"))
+            all_files = sorted(
+                cuentas_dir.glob("*.json"),
+                key=lambda f: (0 if f.stem == active_name else 1, f.stem.lower()),
+            )
             status["codex"]["all_accounts"] = [f.stem for f in all_files]
 
-            is_valid_saved = bool(active_name and not active_name.startswith("(") and (cuentas_dir / f"{active_name}.json").is_file())
-            target_file = (cuentas_dir / f"{active_name}.json") if is_valid_saved else auth_path
-            if target_file.is_file():
-                q = codex_mod.fetch_codex_quota(target_file, active_profile=active_name)
-                err = q.get("err_msg")
-                if err:
-                    status["codex"]["error"] = err
-                else:
-                    rate = q.get("rate_limit") or {}
-                    pw = rate.get("primary_window")
-                    sw = rate.get("secondary_window")
-                    if pw:
-                        used = pw.get("used_percent", 0)
-                        status["codex"]["available_pct"] = max(0, 100 - used)
-                        res_sec = pw.get("reset_after_seconds", 0)
-                        status["codex"]["reset_str"] = format_duration(res_sec)
-                    if sw:
-                        s_used = sw.get("used_percent", 0)
-                        status["codex"]["weekly_pct"] = max(0, 100 - s_used)
-                    elif pw and pw.get("limit_window_seconds", 0) >= 86400 * 5:
-                        status["codex"]["weekly_pct"] = status["codex"]["available_pct"]
+            files_to_check = all_files[:3]
+            is_unsaved_only = False
+            if not files_to_check and auth_path.is_file():
+                files_to_check = [auth_path]
+                is_unsaved_only = True
+
+            def fetch_one_codex(f: Path) -> dict:
+                acc_name = "(sin guardar)" if is_unsaved_only else f.stem
+                is_act = (acc_name == active_name) or is_unsaved_only
+                q = codex_mod.fetch_codex_quota(f, active_profile=active_name)
+                acc_info = {
+                    "name": acc_name,
+                    "is_active": is_act,
+                    "email": q.get("email") or codex_mod.decode_account_from_auth(f),
+                    "plan": (q.get("plan_type") or "desconocido").upper(),
+                    "available_pct": None,
+                    "used_pct": None,
+                    "weekly_pct": None,
+                    "weekly_used_pct": None,
+                    "reset_str": "",
+                    "weekly_reset_str": "",
+                    "error": q.get("err_msg"),
+                }
+                rate = q.get("rate_limit") or {}
+                pw = rate.get("primary_window")
+                sw = rate.get("secondary_window")
+                if pw:
+                    used = int(pw.get("used_percent", 0))
+                    acc_info["used_pct"] = used
+                    acc_info["available_pct"] = max(0, 100 - used)
+                    acc_info["reset_str"] = format_duration(int(pw.get("reset_after_seconds", 0)))
+                if sw:
+                    s_used = int(sw.get("used_percent", 0))
+                    acc_info["weekly_used_pct"] = s_used
+                    acc_info["weekly_pct"] = max(0, 100 - s_used)
+                    acc_info["weekly_reset_str"] = format_duration(int(sw.get("reset_after_seconds", 0)))
+                elif pw and pw.get("limit_window_seconds", 0) >= 86400 * 5:
+                    acc_info["weekly_pct"] = acc_info["available_pct"]
+                    acc_info["weekly_used_pct"] = acc_info["used_pct"]
+                    acc_info["weekly_reset_str"] = acc_info["reset_str"]
+                return acc_info
+
+            with ThreadPoolExecutor(max_workers=min(len(files_to_check), 4) or 1) as pool:
+                codex_accs = list(pool.map(fetch_one_codex, files_to_check))
+
+            status["codex"]["accounts"] = codex_accs
+
+            active_acc = next((a for a in codex_accs if a["is_active"]), None) or (codex_accs[0] if codex_accs else None)
+            if active_acc:
+                status["codex"]["available_pct"] = active_acc.get("available_pct")
+                status["codex"]["weekly_pct"] = active_acc.get("weekly_pct")
+                status["codex"]["reset_str"] = active_acc.get("reset_str", "")
+                status["codex"]["error"] = active_acc.get("error")
         except Exception as e:
             status["codex"]["error"] = str(e)
 
-    # 2. AGY Quota
+    # 2. AGY Quotas (Top 3 cuentas, activa primero)
     if agy_mod:
         try:
             token_path = agy_mod.get_token_path()
@@ -276,51 +314,96 @@ def fetch_tray_status() -> dict:
             status["agy"]["active_name"] = active_name or "sin guardar"
             status["agy"]["active_email"] = agy_mod.decode_email_from_token(token_path)
 
-            all_files = sorted(cuentas_dir.glob("*.token"))
+            all_files = sorted(
+                cuentas_dir.glob("*.token"),
+                key=lambda f: (0 if f.stem == active_name else 1, f.stem.lower()),
+            )
             status["agy"]["all_accounts"] = [f.stem for f in all_files]
 
-            is_valid_saved = bool(active_name and not active_name.startswith("(") and (cuentas_dir / f"{active_name}.token").is_file())
-            target_file = (cuentas_dir / f"{active_name}.token") if is_valid_saved else token_path
-            if target_file.is_file():
-                q = agy_mod.fetch_agy_quota(target_file, active_profile=active_name)
-                err = q.get("err_msg")
-                if err:
-                    status["agy"]["error"] = err
-                else:
-                    models = q.get("models") or {}
-                    now_dt = datetime.now(timezone.utc)
-                    # Gemini
-                    gm = (
-                        models.get("gemini-2.5-flash")
-                        or models.get("gemini-2.5-pro")
-                        or models.get("gemini-3-flash")
-                        or models.get("gemini-3.5-flash-lite")
-                        or models.get("gemini-3.1-flash-lite")
-                        or {}
-                    )
-                    g_frac = gm.get("quotaInfo", {}).get("remainingFraction", 1.0)
-                    status["agy"]["gemini_pct"] = int(round(g_frac * 100))
+            files_to_check = all_files[:3]
+            is_unsaved_only = False
+            if not files_to_check and token_path.is_file():
+                files_to_check = [token_path]
+                is_unsaved_only = True
 
-                    # Claude
-                    cl = (
-                        models.get("claude-sonnet-5-5-high")
-                        or models.get("claude-sonnet-5-5-medium")
-                        or models.get("claude-opus-5-5-medium")
-                        or models.get("claude-opus-5-5-high")
-                        or models.get("claude-opus-4-6-thinking")
-                        or {}
-                    )
-                    c_frac = cl.get("quotaInfo", {}).get("remainingFraction", 1.0)
-                    status["agy"]["claude_pct"] = int(round(c_frac * 100))
+            now_dt = datetime.now(timezone.utc)
 
-                    g_res = gm.get("quotaInfo", {}).get("resetTime", "")
+            def fetch_one_agy(f: Path) -> dict:
+                acc_name = "(sin guardar)" if is_unsaved_only else f.stem
+                is_act = (acc_name == active_name) or is_unsaved_only
+                q = agy_mod.fetch_agy_quota(f, active_profile=active_name)
+                acc_info = {
+                    "name": acc_name,
+                    "is_active": is_act,
+                    "email": q.get("email") or agy_mod.decode_email_from_token(f),
+                    "plan": (q.get("plan") or "Antigravity").upper(),
+                    "gemini_pct": None,
+                    "gemini_used_pct": None,
+                    "claude_pct": None,
+                    "claude_used_pct": None,
+                    "reset_str": "",
+                    "claude_reset_str": "",
+                    "error": q.get("err_msg"),
+                }
+                models = q.get("models") or {}
+                gm = (
+                    models.get("gemini-2.5-flash")
+                    or models.get("gemini-2.5-pro")
+                    or models.get("gemini-3-flash")
+                    or models.get("gemini-3.5-flash-lite")
+                    or {}
+                )
+                g_q = gm.get("quotaInfo", {})
+                if "remainingFraction" in g_q:
+                    g_frac = float(g_q.get("remainingFraction", 1.0))
+                    g_rem = int(round(g_frac * 100))
+                    acc_info["gemini_pct"] = g_rem
+                    acc_info["gemini_used_pct"] = max(0, 100 - g_rem)
+                    g_res = g_q.get("resetTime", "")
                     if g_res:
                         try:
                             dt = datetime.fromisoformat(g_res.replace("Z", "+00:00"))
                             sec = max(0, int((dt - now_dt).total_seconds()))
-                            status["agy"]["reset_str"] = format_duration(sec)
+                            acc_info["reset_str"] = format_duration(sec)
                         except Exception:
                             pass
+
+                cl = (
+                    models.get("claude-sonnet-5-5-high")
+                    or models.get("claude-sonnet-5-5-medium")
+                    or models.get("claude-opus-5-5-medium")
+                    or models.get("claude-opus-5-5-high")
+                    or models.get("claude-opus-4-6-thinking")
+                    or {}
+                )
+                c_q = cl.get("quotaInfo", {})
+                if "remainingFraction" in c_q:
+                    c_frac = float(c_q.get("remainingFraction", 1.0))
+                    c_rem = int(round(c_frac * 100))
+                    acc_info["claude_pct"] = c_rem
+                    acc_info["claude_used_pct"] = max(0, 100 - c_rem)
+                    c_res = c_q.get("resetTime", "")
+                    if c_res:
+                        try:
+                            dt = datetime.fromisoformat(c_res.replace("Z", "+00:00"))
+                            sec = max(0, int((dt - now_dt).total_seconds()))
+                            acc_info["claude_reset_str"] = format_duration(sec)
+                        except Exception:
+                            pass
+
+                return acc_info
+
+            with ThreadPoolExecutor(max_workers=min(len(files_to_check), 4) or 1) as pool:
+                agy_accs = list(pool.map(fetch_one_agy, files_to_check))
+
+            status["agy"]["accounts"] = agy_accs
+
+            active_acc = next((a for a in agy_accs if a["is_active"]), None) or (agy_accs[0] if agy_accs else None)
+            if active_acc:
+                status["agy"]["gemini_pct"] = active_acc.get("gemini_pct")
+                status["agy"]["claude_pct"] = active_acc.get("claude_pct")
+                status["agy"]["reset_str"] = active_acc.get("reset_str", "")
+                status["agy"]["error"] = active_acc.get("error")
         except Exception as e:
             status["agy"]["error"] = str(e)
 
@@ -454,72 +537,117 @@ class LinuxAppIndicatorTray:
         menu.append(title)
         menu.append(Gtk.SeparatorMenuItem())
 
-        # Estado Codex
-        c_acc = codex.get("active_name") or "(ninguna)"
-        c_pct = codex.get("available_pct")
-        c_res = codex.get("reset_str")
-        c_err = codex.get("error")
+        # ==========================================
+        # SECCIÓN OPENAI CODEX (TOP 3)
+        # ==========================================
+        c_head = Gtk.MenuItem(label="── 🟢 OPENAI CODEX (Top 3 Cuentas) ──")
+        c_head.set_sensitive(False)
+        menu.append(c_head)
 
-        if c_err:
-            c_text = f"Codex [{c_acc}]: ⚠️ {c_err}"
-        elif c_pct is not None:
-            res_info = f" · resetea en {c_res}" if c_res else ""
-            c_text = f"Codex [{c_acc}]: {c_pct}% disp{res_info}"
+        c_accounts = codex.get("accounts") or []
+        if not c_accounts:
+            empty_c = Gtk.MenuItem(label="  (Sin cuentas guardadas de Codex)")
+            empty_c.set_sensitive(False)
+            menu.append(empty_c)
         else:
-            c_text = f"Codex [{c_acc}]: Sin datos de cuota"
+            for acc in c_accounts:
+                name = acc.get("name", "")
+                is_act = acc.get("is_active", False)
+                err = acc.get("error")
+                c_pct = acc.get("available_pct")
+                w_pct = acc.get("weekly_pct")
+                res = acc.get("reset_str")
 
-        item_codex = Gtk.MenuItem(label=c_text)
-        item_codex.set_sensitive(False)
-        menu.append(item_codex)
+                if err:
+                    label = f"{'★' if is_act else ' '} {name}: ⚠️ {err}"
+                elif c_pct is not None:
+                    w_info = f" · 7d: {w_pct}%" if w_pct is not None else ""
+                    res_info = f" [⏳ {res}]" if res else ""
+                    prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
+                    label = f"{prefix} {name}: 5h: {c_pct}%{w_info}{res_info}"
+                else:
+                    prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
+                    label = f"{prefix} {name}: Sin datos"
 
-        # Estado AGY
-        a_acc = agy.get("active_name") or "(ninguna)"
-        g_pct = agy.get("gemini_pct")
-        c3_pct = agy.get("claude_pct")
-        a_res = agy.get("reset_str")
-        a_err = agy.get("error")
-
-        if a_err:
-            a_text = f"AGY [{a_acc}]: ⚠️ {a_err}"
-        elif g_pct is not None:
-            res_info = f" ({a_res})" if a_res else ""
-            a_text = f"AGY [{a_acc}]: Gemini {g_pct}% · Claude {c3_pct}%{res_info}"
-        else:
-            a_text = f"AGY [{a_acc}]: Sin datos de cuota"
-
-        item_agy = Gtk.MenuItem(label=a_text)
-        item_agy.set_sensitive(False)
-        menu.append(item_agy)
+                item = Gtk.MenuItem(label=label)
+                if not is_act and not name.startswith("("):
+                    item.connect("activate", self._make_switch_cb("codex", name))
+                else:
+                    item.set_sensitive(False)
+                menu.append(item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # Submenú: Cambiar cuenta Codex
-        c_accounts = codex.get("all_accounts") or []
-        if c_accounts:
+        # ==========================================
+        # SECCIÓN GOOGLE ANTIGRAVITY (TOP 3)
+        # ==========================================
+        a_head = Gtk.MenuItem(label="── 🟣 GOOGLE AGY (Top 3 Cuentas) ──")
+        a_head.set_sensitive(False)
+        menu.append(a_head)
+
+        a_accounts = agy.get("accounts") or []
+        if not a_accounts:
+            empty_a = Gtk.MenuItem(label="  (Sin cuentas guardadas de AGY)")
+            empty_a.set_sensitive(False)
+            menu.append(empty_a)
+        else:
+            for acc in a_accounts:
+                name = acc.get("name", "")
+                is_act = acc.get("is_active", False)
+                err = acc.get("error")
+                g_pct = acc.get("gemini_pct")
+                c_pct = acc.get("claude_pct")
+                res = acc.get("reset_str")
+
+                if err:
+                    label = f"{'★' if is_act else ' '} {name}: ⚠️ {err}"
+                elif g_pct is not None:
+                    res_info = f" [⏳ {res}]" if res else ""
+                    prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
+                    label = f"{prefix} {name}: Gemini {g_pct}% · Claude {c_pct}%{res_info}"
+                else:
+                    prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
+                    label = f"{prefix} {name}: Sin datos"
+
+                item = Gtk.MenuItem(label=label)
+                if not is_act and not name.startswith("("):
+                    item.connect("activate", self._make_switch_cb("agy", name))
+                else:
+                    item.set_sensitive(False)
+                menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Submenú: Todas las cuentas Codex (para cuando hay > 3)
+        all_c = codex.get("all_accounts") or []
+        if len(all_c) > 3:
+            c_acc = codex.get("active_name") or "(ninguna)"
             sub_codex = Gtk.Menu()
-            for acc in c_accounts:
+            for acc in all_c:
                 mark = "✓ " if acc == c_acc else "  "
                 sub_item = Gtk.MenuItem(label=f"{mark}{acc}")
                 sub_item.connect("activate", self._make_switch_cb("codex", acc))
                 sub_codex.append(sub_item)
-            item_switch_c = Gtk.MenuItem(label="Cambiar cuenta Codex ▸")
+            item_switch_c = Gtk.MenuItem(label="Ver todas las cuentas Codex ▸")
             item_switch_c.set_submenu(sub_codex)
             menu.append(item_switch_c)
 
-        # Submenú: Cambiar cuenta AGY
-        a_accounts = agy.get("all_accounts") or []
-        if a_accounts:
+        # Submenú: Todas las cuentas AGY (para cuando hay > 3)
+        all_a = agy.get("all_accounts") or []
+        if len(all_a) > 3:
+            a_acc = agy.get("active_name") or "(ninguna)"
             sub_agy = Gtk.Menu()
-            for acc in a_accounts:
+            for acc in all_a:
                 mark = "✓ " if acc == a_acc else "  "
                 sub_item = Gtk.MenuItem(label=f"{mark}{acc}")
                 sub_item.connect("activate", self._make_switch_cb("agy", acc))
                 sub_agy.append(sub_item)
-            item_switch_a = Gtk.MenuItem(label="Cambiar cuenta AGY ▸")
+            item_switch_a = Gtk.MenuItem(label="Ver todas las cuentas AGY ▸")
             item_switch_a.set_submenu(sub_agy)
             menu.append(item_switch_a)
 
-        menu.append(Gtk.SeparatorMenuItem())
+        if len(all_c) > 3 or len(all_a) > 3:
+            menu.append(Gtk.SeparatorMenuItem())
 
         # Botón Actualizar
         item_refresh = Gtk.MenuItem(label="↻ Actualizar ahora")
@@ -665,15 +793,63 @@ def main():
             print(f"Archivo de configuración: {get_autostart_path()}")
         return
 
-    # Consulta rápida en terminal
+    # Consulta rápida en terminal (Separada por proveedor, max 3 cuentas, actual + semanal + recarga)
     if args.status:
         data = fetch_tray_status()
-        c = data.get("codex", {})
-        a = data.get("agy", {})
-        print("\n✦ Estado rápido de tokens para la barra de tareas:")
-        print(f"  • Codex: [{c.get('active_name')}] {c.get('available_pct')}% disponible (resetea en {c.get('reset_str') or 'N/A'})")
-        print(f"  • AGY  : [{a.get('active_name')}] Gemini {a.get('gemini_pct')}% · Claude {a.get('claude_pct')}%")
-        print(f"  • Auto-inicio al encender PC: {'Activado' if is_autostart_enabled() else 'Desactivado'}\n")
+        codex = data.get("codex", {})
+        agy = data.get("agy", {})
+
+        print("\n╭─────────────────────────────────────────────────────────────╮")
+        print("│  ✦ Estado de Tokens por Proveedor (Top 3 Cuentas)           │")
+        print("╰─────────────────────────────────────────────────────────────╯")
+
+        print("\n  \033[1;32m🟢 OPENAI CODEX (Máximo 3 cuentas)\033[0m")
+        c_accs = codex.get("accounts") or []
+        if not c_accs:
+            print("    (No hay cuentas guardadas. Usa: codex-switch guardar <nombre>)")
+        for acc in c_accs:
+            name = acc.get("name")
+            is_act = acc.get("is_active")
+            email = acc.get("email") or "Sin email"
+            plan = acc.get("plan") or "ESTÁNDAR"
+            star = "\033[1;33m★ [ACTIVA]\033[0m" if is_act else " " * 10
+            print(f"  {star} \033[1m{name:16}\033[0m \033[2m{email}\033[0m [{plan}]")
+            if acc.get("error"):
+                print(f"              ⚠️  \033[1;31m{acc.get('error')}\033[0m")
+            else:
+                c_pct = acc.get("available_pct", 0) if acc.get("available_pct") is not None else "N/A"
+                c_used = acc.get("used_pct", 0) if acc.get("used_pct") is not None else "N/A"
+                c_res = acc.get("reset_str") or "reseteado"
+                w_pct = acc.get("weekly_pct", 0) if acc.get("weekly_pct") is not None else "N/A"
+                w_used = acc.get("weekly_used_pct", 0) if acc.get("weekly_used_pct") is not None else "N/A"
+                w_res = acc.get("weekly_reset_str") or "reseteado"
+                print(f"              • Estado Actual  (5h) : \033[1m{c_pct}%\033[0m disp · {c_used}% usado (resetea en: {c_res})")
+                print(f"              • Estado Semanal (7d) : \033[1m{w_pct}%\033[0m disp · {w_used}% usado (resetea en: {w_res})")
+
+        print("\n  \033[1;35m🟣 GOOGLE ANTIGRAVITY (Máximo 3 cuentas)\033[0m")
+        a_accs = agy.get("accounts") or []
+        if not a_accs:
+            print("    (No hay cuentas guardadas. Usa: agy-switch guardar <nombre>)")
+        for acc in a_accs:
+            name = acc.get("name")
+            is_act = acc.get("is_active")
+            email = acc.get("email") or "Sin email"
+            plan = acc.get("plan") or "ANTIGRAVITY"
+            star = "\033[1;33m★ [ACTIVA]\033[0m" if is_act else " " * 10
+            print(f"  {star} \033[1m{name:16}\033[0m \033[2m{email}\033[0m [{plan}]")
+            if acc.get("error"):
+                print(f"              ⚠️  \033[1;31m{acc.get('error')}\033[0m")
+            else:
+                g_pct = acc.get("gemini_pct", 0) if acc.get("gemini_pct") is not None else "N/A"
+                g_used = acc.get("gemini_used_pct", 0) if acc.get("gemini_used_pct") is not None else "N/A"
+                g_res = acc.get("reset_str") or "reseteado"
+                c_pct = acc.get("claude_pct", 0) if acc.get("claude_pct") is not None else "N/A"
+                c_used = acc.get("claude_used_pct", 0) if acc.get("claude_used_pct") is not None else "N/A"
+                c_res = acc.get("claude_reset_str") or "reseteado"
+                print(f"              • Gemini Models (5h)  : \033[1m{g_pct}%\033[0m disp · {g_used}% usado (resetea en: {g_res})")
+                print(f"              • Claude 3P / Semanal : \033[1m{c_pct}%\033[0m disp · {c_used}% usado (resetea en: {c_res})")
+
+        print(f"\n  • Auto-inicio al encender PC: {'\033[1;32mHABILITADO\033[0m' if is_autostart_enabled() else '\033[1;33mDESHABILITADO\033[0m'}\n")
         return
 
     # Iniciar en modo barra de tareas
