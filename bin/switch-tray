@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # ==============================================================================
 # CARGA DE MÓDULOS DE CODEX Y AGY
