@@ -868,65 +868,99 @@ def cmd_agregar(nombre: str, desde: str = "", force: bool = False):
             tmp_token.write_text(json.dumps(data, indent=2), encoding="utf-8")
             src_file = tmp_token
         else:
-            # Login interactivo aislado con HOME temporal y shim para xdg-open
+            # Login interactivo con patrón Seguro Swap & Restore (compatible con GNOME Keyring / Secret Service y D-Bus)
             print("\n╭─────────────────────────────────────────────────────────────╮")
-            print("│  ✦ AGREGAR CUENTA EN ENTORNO AISLADO (SIN TOCAR TU SESIÓN)  │")
+            print("│  ✦ AGREGAR CUENTA (SWAP TEMPORAL CON RESTAURACIÓN ACTIVA)   │")
             print("╰─────────────────────────────────────────────────────────────╯")
             print(f"  • Cuenta activa actual : \033[1;32m{active_email}\033[0m ({active_profile})")
             print(f"  • Nuevo perfil         : \033[1;36m{nombre}\033[0m")
-            print("\n  🛡️  Esta operación se ejecutará en un entorno temporal aislado:")
-            print("     • Tus chats abiertos de Antigravity NO se cerrarán ni interrumpirán.")
-            print("     • Tu token activo y sesión actual NO sufrirán ninguna modificación.")
+            print("\n  🛡️  Tu sesión activa previa será RESTAURADA automáticamente:")
+            print("     • Al finalizar el login, tu token anterior volverá a ser el activo.")
             print("     • El nuevo perfil se guardará exclusivamente en cuentas/ para monitoreo.")
-            print("\n🚀 Preparando inicio de sesión aislado para la nueva cuenta...")
+            print("\n  💡 \033[1;33mIMPORTANTE:\033[0m Si ya tienes tu cuenta principal abierta en el navegador,")
+            print("     abre el enlace de inicio de sesión en una \033[1mVENTANA DE INCÓGNITO\033[0m o selecciona")
+            print("     tu cuenta secundaria en Google para evitar reautenticar la misma cuenta.")
+            print("\n🚀 Preparando inicio de sesión para la nueva cuenta...")
             print("   Se abrirá 'agy'. Completa el flujo de autenticación OAuth en tu navegador.")
             print("   Una vez autenticado en la terminal de agy, sal con Ctrl+D o /exit.\n")
 
-            shim_dir = tmp_path / "shim"
-            shim_dir.mkdir(parents=True, exist_ok=True)
+            temp_backup = get_base_dir() / f"antigravity-oauth-token.swap.{os.getpid()}.bak"
+            has_disk_token = token_path.is_file() and token_path.stat().st_size > 10
+            if has_disk_token:
+                try:
+                    shutil.copyfile(token_path, temp_backup)
+                except Exception as e:
+                    print(f"❌ Error al crear respaldo temporal del token: {e}")
+                    sys.exit(1)
 
-            real_home = str(Path.home())
-            real_dbus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+            keyring_backup = extract_token_from_keyring()
+            if keyring_backup:
+                clear_token_from_keyring()
 
-            xdg_open_shim = shim_dir / "xdg-open"
-            xdg_script = f"""#!/bin/sh
-export HOME="{real_home}"
-export XDG_DATA_HOME="{real_home}/.local/share"
-export XDG_CONFIG_HOME="{real_home}/.config"
-if [ -n "{real_dbus}" ]; then
-    export DBUS_SESSION_BUS_ADDRESS="{real_dbus}"
-fi
-if [ -x /usr/bin/xdg-open ]; then
-    exec /usr/bin/xdg-open "$@"
-else
-    exec xdg-open "$@"
-fi
-"""
-            xdg_open_shim.write_text(xdg_script, encoding="utf-8")
-            xdg_open_shim.chmod(0o755)
+            if token_path.is_file():
+                try:
+                    token_path.unlink()
+                except Exception:
+                    pass
 
-            isolated_env = os.environ.copy()
-            isolated_env["HOME"] = str(tmp_path)
-            isolated_env["DBUS_SESSION_BUS_ADDRESS"] = ""
-            isolated_env["XDG_DATA_HOME"] = str(tmp_path / ".local" / "share")
-            isolated_env["XDG_CONFIG_HOME"] = str(tmp_path / ".config")
-            isolated_env["PATH"] = f"{shim_dir}:{isolated_env.get('PATH', '')}"
-
+            new_token_data = None
+            cancelled = False
             try:
-                subprocess.run(["agy"], env=isolated_env, check=False)
+                subprocess.run(["agy"], check=False)
             except FileNotFoundError:
                 print("❌ No se encontró el ejecutable 'agy'.")
                 sys.exit(127)
             except KeyboardInterrupt:
-                print("\n\n⚠️ Operación cancelada por el usuario. Tu sesión activa sigue intacta.")
+                print("\n\n⚠️ Operación cancelada por el usuario.")
+                cancelled = True
+            finally:
+                # 1. Capturar el nuevo token generado (en disco o en GNOME Keyring)
+                ensure_active_token_on_disk()
+                if token_path.is_file() and token_path.stat().st_size > 10:
+                    try:
+                        new_token_data = token_path.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
+                if not new_token_data:
+                    new_keyring = extract_token_from_keyring()
+                    if new_keyring:
+                        new_token_data = new_keyring
+
+                # 2. RESTAURAR INMEDIATAMENTE la sesión previa activa en disco y keyring
+                if has_disk_token and temp_backup.is_file():
+                    try:
+                        os.replace(temp_backup, token_path)
+                    except Exception:
+                        shutil.copyfile(temp_backup, token_path)
+                        temp_backup.unlink()
+                elif token_path.is_file() and not has_disk_token:
+                    try:
+                        token_path.unlink()
+                    except Exception:
+                        pass
+
+                if keyring_backup:
+                    sync_token_to_keyring(keyring_backup)
+                else:
+                    clear_token_from_keyring()
+
+                if temp_backup.is_file():
+                    try:
+                        temp_backup.unlink()
+                    except Exception:
+                        pass
+
+            if cancelled:
+                print("   Tu sesión activa sigue intacta.\n")
                 sys.exit(130)
 
-            isolated_token = tmp_path / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-            if not isolated_token.is_file() or isolated_token.stat().st_size <= 10:
-                print("\n⚠️ No se detectó inicio de sesión completado en el entorno aislado.")
-                print("   No se guardó ninguna cuenta nueva. Tu sesión activa sigue intacta.")
+            if not new_token_data:
+                print("\n⚠️ No se detectó inicio de sesión completado.")
+                print("   No se guardó ninguna cuenta nueva. Tu sesión activa sigue intacta.\n")
                 sys.exit(1)
-            src_file = isolated_token
+
+            tmp_token.write_text(new_token_data, encoding="utf-8")
+            src_file = tmp_token
 
         # Validar credenciales generadas
         try:
@@ -1186,7 +1220,7 @@ def cmd_usar(nombre: str, force: bool = False):
     if running_clients and not force:
         email = decode_email_from_token(token_path)
         print("\n╭─────────────────────────────────────────────────────────────╮")
-        print("│  ⛔ CAMBIO CANCELADO POR SEGURIDAD                          │")
+        print("│  ⚠️  SESIONES ACTIVAS DE ANTIGRAVITY DETECTADAS             │")
         print("╰─────────────────────────────────────────────────────────────╯")
         print(f"  • Cuenta activa actual : \033[1;32m{email}\033[0m ({active_profile})")
         print(f"  • Cuenta a seleccionar : \033[1;36m{nombre}\033[0m")
@@ -1199,18 +1233,30 @@ def cmd_usar(nombre: str, force: bool = False):
             el_text = f" [{el}]" if el else ""
             print(f"     → \033[1mPID {pid}\033[0m en \033[1;33m{tty}\033[0m: {cmd}{el_text}")
 
-        print("\n  🛡️  ¿Por qué se canceló el cambio?")
-        print("     Cambiar de cuenta mientras tienes chats de Antigravity abiertos puede interrumpir")
+        print("\n  🛡️  Cambiar de cuenta mientras tienes chats de Antigravity abiertos puede interrumpir")
         print("     tus conversaciones en curso e invalidar el token de tu cuenta activa actual.")
-        print("\n  Para cambiar de forma segura:")
-        print("     1. Ve a las terminales indicadas arriba y cierra las sesiones (/exit o Ctrl+D).")
-        print(f"     2. Vuelve a ejecutar: \033[1magy-switch usar {nombre}\033[0m")
-        print("\n  Si eres consciente del riesgo y deseas forzar el cambio de todas formas:")
-        print(f"     \033[1;31magy-switch usar {nombre} --force\033[0m\n")
-        sys.exit(1)
+
+        if sys.stdin.isatty():
+            try:
+                resp = input("\n  ¿Deseas continuar y cambiar de cuenta de todas formas? (s/N): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\n⛔ Operación cancelada por el usuario.")
+                sys.exit(130)
+            if resp in ("s", "si", "sí", "y", "yes"):
+                force = True
+            else:
+                print("\n⛔ Cambio de cuenta cancelado por el usuario.\n")
+                sys.exit(1)
+        else:
+            print("\n  Para cambiar de forma segura:")
+            print("     1. Ve a las terminales indicadas arriba y cierra las sesiones (/exit o Ctrl+D).")
+            print(f"     2. Vuelve a ejecutar: \033[1magy-switch usar {nombre}\033[0m")
+            print("\n  Si deseas forzar el cambio en entornos no interactivos:")
+            print(f"     \033[1;31magy-switch usar {nombre} --force\033[0m (o: \033[1;31m-y\033[0m)\n")
+            sys.exit(1)
 
     if running_clients and force:
-        print(f"\n⚠️  Advertencia: Forzando cambio de cuenta (--force) con {len(running_clients)} proceso(s) activo(s)...", flush=True)
+        print(f"\n⚠️  Advertencia: Continuando cambio de cuenta con {len(running_clients)} proceso(s) activo(s)...", flush=True)
 
     # Sincronizar credenciales salientes antes de conmutar para no perder tokens frescos o logins
     prev_active = get_recorded_active_profile() or active_profile
@@ -1265,7 +1311,7 @@ def cmd_nueva(nombre: str, force: bool = False, aislada: bool = False):
         email = decode_email_from_token(token_path)
         active_profile = find_active_profile_name(cuentas_dir, token_path)
         print("\n╭─────────────────────────────────────────────────────────────╮")
-        print("│  ⛔ INICIO DE SESIÓN CANCELADO POR SEGURIDAD                │")
+        print("│  ⚠️  SESIONES ACTIVAS DE ANTIGRAVITY DETECTADAS             │")
         print("╰─────────────────────────────────────────────────────────────╯")
         print(f"  • Cuenta activa actual : \033[1;32m{email}\033[0m ({active_profile})")
         print(f"\n  ⚠️  Hay {len(running_clients)} chat(s)/sesión(es) activa(s) de Antigravity abiertas:")
@@ -1277,16 +1323,28 @@ def cmd_nueva(nombre: str, force: bool = False, aislada: bool = False):
             el_text = f" [{el}]" if el else ""
             print(f"     → \033[1mPID {pid}\033[0m en \033[1;33m{tty}\033[0m: {cmd}{el_text}")
         print("\n  Iniciar sesión con otra cuenta ahora reemplazará tus credenciales activas y puede")
-        print("  romper o cerrar esas conversaciones.")
+        print("  interrumpir esas conversaciones.")
         print(f"\n  💡 Tip: Si solo deseas registrar la cuenta para monitorear sus tokens/cuotas")
         print(f"     sin cerrar tus chats activos ni cambiar la cuenta activa, usa:")
-        print(f"     \033[1;32magy-switch agregar {nombre}\033[0m")
-        print(f"\n  Para reemplazar la cuenta activa de todas formas:")
-        print(f"     Cierra las sesiones indicadas o usa: \033[1;31magy-switch nueva {nombre} --force\033[0m\n")
-        sys.exit(1)
+        print(f"     \033[1;32magy-switch agregar {nombre}\033[0m\n")
+
+        if sys.stdin.isatty():
+            try:
+                resp = input("  ¿Deseas continuar e iniciar sesión de todas formas? (s/N): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\n⛔ Operación cancelada por el usuario.")
+                sys.exit(130)
+            if resp in ("s", "si", "sí", "y", "yes"):
+                force = True
+            else:
+                print("\n⛔ Operación cancelada por el usuario.\n")
+                sys.exit(1)
+        else:
+            print("  Para continuar de todas formas en entornos no interactivos, usa: --force o -y\n")
+            sys.exit(1)
 
     if running_clients and force:
-        print(f"\n⚠️  Advertencia: Forzando inicio de sesión (--force) con {len(running_clients)} proceso(s) activo(s)...", flush=True)
+        print(f"\n⚠️  Advertencia: Continuando inicio de sesión con {len(running_clients)} proceso(s) activo(s)...", flush=True)
 
     # Si hay token activo y no está guardado, guardarlo como backup
     if token_path.is_file() and token_path.stat().st_size > 10:
@@ -1309,6 +1367,9 @@ def cmd_nueva(nombre: str, force: bool = False, aislada: bool = False):
     print("\n🚀 Preparando inicio de sesión para la nueva cuenta...")
     print("   Se abrirá 'agy'. Completa el flujo de autenticación OAuth en tu navegador.")
     print("   Una vez que agy cargue, sal con Ctrl+D o /exit.\n")
+    print("  💡 \033[1;33mIMPORTANTE:\033[0m Si ya tienes tu cuenta principal abierta en el navegador,")
+    print("     abre el enlace de inicio de sesión en una \033[1mVENTANA DE INCÓGNITO\033[0m o selecciona")
+    print("     tu cuenta secundaria en Google para evitar reautenticar la misma cuenta.\n")
     try:
         subprocess.run(["agy"], check=False)
     finally:
@@ -1364,6 +1425,9 @@ def cmd_reautenticar(nombre: str = ""):
 
     print("   Se abrirá 'agy'. Completa el flujo de autenticación OAuth en tu navegador.")
     print("   Una vez que cargue la interfaz, sal con Ctrl+D o /exit.\n")
+    print("  💡 \033[1;33mIMPORTANTE:\033[0m Si ya tienes otra cuenta abierta en el navegador,")
+    print(f"     asegúrate de seleccionar en Google la cuenta de '\033[1;36m{nombre}\033[0m'")
+    print("     o abre el enlace en una \033[1mVENTANA DE INCÓGNITO\033[0m para evitar reautenticar una cuenta distinta.\n")
     try:
         subprocess.run(["agy"], check=False)
     finally:
@@ -2035,11 +2099,13 @@ def main():
         nuevo = args[2] if len(args) > 2 and not args[2].startswith("-") else ""
         cmd_renombrar(actual, nuevo)
     elif args[0] in ("usar", "use", "switch"):
-        nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
-        force = any(a in ("--force", "-f") for a in args[1:])
+        positionals = [a for a in args[1:] if not a.startswith("-")]
+        nombre = positionals[0] if positionals else ""
+        force = any(a in ("--force", "-f", "-y", "--yes") for a in args[1:])
         cmd_usar(nombre, force=force)
     elif args[0] in ("reautenticar", "reauth"):
-        nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        positionals = [a for a in args[1:] if not a.startswith("-")]
+        nombre = positionals[0] if positionals else ""
         cmd_reautenticar(nombre)
     elif args[0] in ("agregar", "add"):
         i = 1
@@ -2056,11 +2122,11 @@ def main():
                 else:
                     print("❌ Error: --desde requiere una ruta de archivo o JSON.")
                     sys.exit(2)
-            elif a in ("--force", "-f"):
+            elif a in ("--force", "-f", "-y", "--yes"):
                 force = True
             elif a.startswith("-"):
                 print(f"Opción no reconocida: {a}")
-                print("Uso: agy-switch agregar <nombre> [--desde <ruta_o_json>] [--force]")
+                print("Uso: agy-switch agregar <nombre> [--desde <ruta_o_json>] [--force|-y]")
                 sys.exit(2)
             else:
                 positionals.append(a)
@@ -2068,17 +2134,18 @@ def main():
         nombre = positionals[0] if positionals else ""
         cmd_agregar(nombre, desde=desde, force=force)
     elif args[0] in ("nueva", "new", "login", "login-nueva"):
-        nombre = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
-        options = [a for a in args[1:] if a != nombre]
-        force = any(a in ("--force", "-f") for a in options)
+        positionals = [a for a in args[1:] if not a.startswith("-")]
+        nombre = positionals[0] if positionals else ""
+        options = [a for a in args[1:] if a.startswith("-")]
+        force = any(a in ("--force", "-f", "-y", "--yes") for a in options)
         aislada = any(a in ("--aislada", "--no-switch", "--isolated") for a in options)
         if nombre and (get_cuentas_dir() / f"{nombre}.token").is_file() and args[0] == "login":
             cmd_reautenticar(nombre)
             sys.exit(0)
-        unknown = [option for option in options if option not in ("--force", "-f", "--aislada", "--no-switch", "--isolated")]
+        unknown = [option for option in options if option not in ("--force", "-f", "-y", "--yes", "--aislada", "--no-switch", "--isolated")]
         if unknown:
             print(f"Opción no reconocida para nueva cuenta: {unknown[0]}")
-            print("Uso: agy-switch nueva <nombre> [--force] [--aislada]")
+            print("Uso: agy-switch nueva <nombre> [--force|-y] [--aislada]")
             sys.exit(2)
         cmd_nueva(nombre, force=force, aislada=aislada)
     elif args[0] in ("continuar", "continue", "resume", "-c"):
