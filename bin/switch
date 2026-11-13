@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 GITHUB_REPO = "Jyzus/cli-account-switch"
 INSTALL_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
 

@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 # ==============================================================================
 # CARGA DE MÓDULOS DE CODEX Y AGY
@@ -414,12 +414,79 @@ def fetch_tray_status() -> dict:
 # IMPLEMENTACIÓN NATIVA EN LINUX CON AYATANA / APPINDICATOR (GTK3)
 # ==============================================================================
 
+GTK_CUSTOM_CSS = b"""
+* {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Ubuntu, sans-serif;
+}
+window, .widget-box {
+    background-color: #0d1117;
+}
+.widget-box {
+    padding: 10px;
+}
+.account-card {
+    background-color: rgba(22, 27, 34, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 5px;
+}
+.account-card.active {
+    border-color: rgba(99, 102, 241, 0.5);
+    background-color: rgba(26, 32, 44, 0.98);
+}
+progressbar trough {
+    background-color: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    min-height: 6px;
+    border: none;
+}
+progressbar progress {
+    background-color: #10b981;
+    border-radius: 4px;
+    min-height: 6px;
+}
+progressbar.amber progress {
+    background-color: #f59e0b;
+}
+progressbar.red progress {
+    background-color: #ef4444;
+}
+.footer-btn {
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+.btn-monitor {
+    background-image: none;
+    background-color: #4f46e5;
+    color: #ffffff;
+    border: 1px solid #6366f1;
+}
+.btn-monitor:hover {
+    background-color: #4338ca;
+}
+.btn-refresh {
+    background-image: none;
+    background-color: #21262d;
+    color: #c9d1d9;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+}
+.btn-refresh:hover {
+    background-color: #30363d;
+}
+"""
+
+
 class LinuxAppIndicatorTray:
     def __init__(self, interval: int = 300):
         self.interval = max(30, interval)
         self.icons = ensure_tray_icons()
         self.current_status: dict = {}
         self.indicator = None
+        self.Gtk = None
+        self.GLib = None
 
     def start(self):
         import gi
@@ -438,7 +505,7 @@ class LinuxAppIndicatorTray:
                 print("   Instala: sudo apt install gir12.1-ayatanaappindicator3-0.1", file=sys.stderr)
                 sys.exit(1)
 
-        from gi.repository import Gtk, GLib
+        from gi.repository import Gtk, GLib, Gdk
 
         self.Gtk = Gtk
         self.GLib = GLib
@@ -451,6 +518,18 @@ class LinuxAppIndicatorTray:
             print("   O habilita el auto-arranque con: switch-tray --autostart enable", file=sys.stderr)
             sys.exit(1)
 
+        # Cargar estilos CSS modernos para barras de progreso y botones
+        try:
+            style_provider = Gtk.CssProvider()
+            style_provider.load_from_data(GTK_CUSTOM_CSS)
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(),
+                style_provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+        except Exception:
+            pass
+
         initial_icon = self.icons.get("green", "utilities-system-monitor")
         self.indicator = AppIndicator.Indicator.new(
             "cli-account-switch-tray",
@@ -458,7 +537,7 @@ class LinuxAppIndicatorTray:
             AppIndicator.IndicatorCategory.APPLICATION_STATUS,
         )
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
-        self.indicator.set_title("CLI Account Switch")
+        self.indicator.set_title("Switch")
 
         # Construir menú inicial
         self.menu = Gtk.Menu()
@@ -525,17 +604,138 @@ class LinuxAppIndicatorTray:
         # Reconstruir menú desplegable
         self._rebuild_menu()
 
+    def _create_account_item(self, provider: str, acc: dict):
+        if not self.Gtk:
+            import gi
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk
+            self.Gtk = Gtk
+        Gtk = self.Gtk
+        name = acc.get("name", "")
+        is_act = acc.get("is_active", False)
+        err = acc.get("error")
+
+        item = Gtk.MenuItem()
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        vbox.set_margin_top(3)
+        vbox.set_margin_bottom(3)
+        vbox.set_margin_start(8)
+        vbox.set_margin_end(8)
+
+        prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
+        p_color = "#38bdf8" if is_act else "#94a3b8"
+
+        if provider == "codex":
+            c_pct = acc.get("available_pct")
+            w_pct = acc.get("weekly_pct")
+            res = acc.get("reset_str")
+
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            lbl_name = Gtk.Label()
+            lbl_name.set_markup(f"<span foreground='{p_color}'><b>{prefix}</b></span> <b>{name}</b>")
+            lbl_name.set_xalign(0.0)
+            row.pack_start(lbl_name, True, True, 0)
+
+            if c_pct is not None:
+                c_color = "#34d399" if c_pct > 40 else ("#fbbf24" if c_pct > 15 else "#f87171")
+                lbl_pct = Gtk.Label()
+                lbl_pct.set_markup(f"<span foreground='{c_color}'><b>{c_pct}%</b> disp</span>")
+                lbl_pct.set_xalign(1.0)
+                row.pack_end(lbl_pct, False, False, 0)
+            vbox.pack_start(row, False, False, 0)
+
+            if err:
+                lbl_err = Gtk.Label()
+                lbl_err.set_markup(f"<span size='smaller' foreground='#ef4444'>⚠️ {err}</span>")
+                lbl_err.set_xalign(0.0)
+                vbox.pack_start(lbl_err, False, False, 0)
+            elif c_pct is not None:
+                pbar = Gtk.ProgressBar()
+                pbar.set_fraction(max(0.0, min(1.0, c_pct / 100.0)))
+                if c_pct <= 15:
+                    pbar.get_style_context().add_class("red")
+                elif c_pct <= 40:
+                    pbar.get_style_context().add_class("amber")
+                vbox.pack_start(pbar, False, False, 1)
+
+                sub_parts = []
+                if res:
+                    sub_parts.append(f"⏳ Resetea en: {res}")
+                if w_pct is not None:
+                    sub_parts.append(f"📅 Semanal: {w_pct}%")
+
+                if sub_parts:
+                    lbl_sub = Gtk.Label()
+                    sub_text = "   ·   ".join(sub_parts)
+                    lbl_sub.set_markup(f"<span size='smaller' foreground='#8b949e'>{sub_text}</span>")
+                    lbl_sub.set_xalign(0.0)
+                    vbox.pack_start(lbl_sub, False, False, 0)
+
+        else:  # agy
+            g_pct = acc.get("gemini_pct")
+            c_pct = acc.get("claude_pct")
+            res = acc.get("reset_str")
+
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            lbl_name = Gtk.Label()
+            lbl_name.set_markup(f"<span foreground='{p_color}'><b>{prefix}</b></span> <b>{name}</b>")
+            lbl_name.set_xalign(0.0)
+            row.pack_start(lbl_name, True, True, 0)
+
+            if g_pct is not None:
+                g_color = "#34d399" if g_pct > 40 else ("#fbbf24" if g_pct > 15 else "#f87171")
+                lbl_pct = Gtk.Label()
+                lbl_pct.set_markup(f"<span foreground='{g_color}'><b>Gemini {g_pct}%</b></span>")
+                lbl_pct.set_xalign(1.0)
+                row.pack_end(lbl_pct, False, False, 0)
+            vbox.pack_start(row, False, False, 0)
+
+            if err:
+                lbl_err = Gtk.Label()
+                lbl_err.set_markup(f"<span size='smaller' foreground='#ef4444'>⚠️ {err}</span>")
+                lbl_err.set_xalign(0.0)
+                vbox.pack_start(lbl_err, False, False, 0)
+            elif g_pct is not None:
+                pbar = Gtk.ProgressBar()
+                pbar.set_fraction(max(0.0, min(1.0, g_pct / 100.0)))
+                if g_pct <= 15:
+                    pbar.get_style_context().add_class("red")
+                elif g_pct <= 40:
+                    pbar.get_style_context().add_class("amber")
+                vbox.pack_start(pbar, False, False, 1)
+
+                sub_parts = []
+                if res:
+                    sub_parts.append(f"⏳ Resetea en: {res}")
+                if c_pct is not None:
+                    sub_parts.append(f"Claude 3P: {c_pct}%")
+
+                if sub_parts:
+                    lbl_sub = Gtk.Label()
+                    sub_text = "   ·   ".join(sub_parts)
+                    lbl_sub.set_markup(f"<span size='smaller' foreground='#8b949e'>{sub_text}</span>")
+                    lbl_sub.set_xalign(0.0)
+                    vbox.pack_start(lbl_sub, False, False, 0)
+
+        item.add(vbox)
+
+        if not is_act and not name.startswith("("):
+            item.connect("activate", self._make_switch_cb(provider, name))
+        else:
+            item.set_sensitive(False)
+
+        return item
+
     def _rebuild_menu(self):
+        if not self.Gtk:
+            import gi
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk
+            self.Gtk = Gtk
         Gtk = self.Gtk
         menu = Gtk.Menu()
         codex = self.current_status.get("codex", {})
         agy = self.current_status.get("agy", {})
-
-        # Encabezado
-        title = Gtk.MenuItem(label="✦ CLI Account Switch")
-        title.set_sensitive(False)
-        menu.append(title)
-        menu.append(Gtk.SeparatorMenuItem())
 
         # ==========================================
         # SECCIÓN OPENAI CODEX (TOP 3)
@@ -544,37 +744,14 @@ class LinuxAppIndicatorTray:
         c_head.set_sensitive(False)
         menu.append(c_head)
 
-        c_accounts = codex.get("accounts") or []
+        c_accounts = (codex.get("accounts") or [])[:3]
         if not c_accounts:
             empty_c = Gtk.MenuItem(label="  (Sin cuentas guardadas de Codex)")
             empty_c.set_sensitive(False)
             menu.append(empty_c)
         else:
             for acc in c_accounts:
-                name = acc.get("name", "")
-                is_act = acc.get("is_active", False)
-                err = acc.get("error")
-                c_pct = acc.get("available_pct")
-                w_pct = acc.get("weekly_pct")
-                res = acc.get("reset_str")
-
-                if err:
-                    label = f"{'★' if is_act else ' '} {name}: ⚠️ {err}"
-                elif c_pct is not None:
-                    w_info = f" · 7d: {w_pct}%" if w_pct is not None else ""
-                    res_info = f" [⏳ {res}]" if res else ""
-                    prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
-                    label = f"{prefix} {name}: 5h: {c_pct}%{w_info}{res_info}"
-                else:
-                    prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
-                    label = f"{prefix} {name}: Sin datos"
-
-                item = Gtk.MenuItem(label=label)
-                if not is_act and not name.startswith("("):
-                    item.connect("activate", self._make_switch_cb("codex", name))
-                else:
-                    item.set_sensitive(False)
-                menu.append(item)
+                menu.append(self._create_account_item("codex", acc))
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -585,36 +762,14 @@ class LinuxAppIndicatorTray:
         a_head.set_sensitive(False)
         menu.append(a_head)
 
-        a_accounts = agy.get("accounts") or []
+        a_accounts = (agy.get("accounts") or [])[:3]
         if not a_accounts:
             empty_a = Gtk.MenuItem(label="  (Sin cuentas guardadas de AGY)")
             empty_a.set_sensitive(False)
             menu.append(empty_a)
         else:
             for acc in a_accounts:
-                name = acc.get("name", "")
-                is_act = acc.get("is_active", False)
-                err = acc.get("error")
-                g_pct = acc.get("gemini_pct")
-                c_pct = acc.get("claude_pct")
-                res = acc.get("reset_str")
-
-                if err:
-                    label = f"{'★' if is_act else ' '} {name}: ⚠️ {err}"
-                elif g_pct is not None:
-                    res_info = f" [⏳ {res}]" if res else ""
-                    prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
-                    label = f"{prefix} {name}: Gemini {g_pct}% · Claude {c_pct}%{res_info}"
-                else:
-                    prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
-                    label = f"{prefix} {name}: Sin datos"
-
-                item = Gtk.MenuItem(label=label)
-                if not is_act and not name.startswith("("):
-                    item.connect("activate", self._make_switch_cb("agy", name))
-                else:
-                    item.set_sensitive(False)
-                menu.append(item)
+                menu.append(self._create_account_item("agy", acc))
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -649,32 +804,33 @@ class LinuxAppIndicatorTray:
         if len(all_c) > 3 or len(all_a) > 3:
             menu.append(Gtk.SeparatorMenuItem())
 
-        # Botón Actualizar
-        item_refresh = Gtk.MenuItem(label="↻ Actualizar ahora")
-        item_refresh.connect("activate", lambda _: self.trigger_refresh())
-        menu.append(item_refresh)
+        # Pie con 2 botones lado a lado: Monitor y Actualizar
+        footer_item = Gtk.MenuItem()
+        footer_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        footer_box.set_margin_top(4)
+        footer_box.set_margin_bottom(4)
+        footer_box.set_margin_start(6)
+        footer_box.set_margin_end(6)
 
-        # Botón Abrir Widget Completo
-        item_open_widget = Gtk.MenuItem(label="📊 Abrir Monitor Completo (Widget)")
-        item_open_widget.connect("activate", lambda _: self._open_full_widget())
-        menu.append(item_open_widget)
+        btn_monitor = Gtk.Button(label="📊 Abrir Monitor")
+        btn_monitor.get_style_context().add_class("footer-btn")
+        btn_monitor.get_style_context().add_class("btn-monitor")
+        btn_monitor.connect("clicked", lambda _: self._open_full_widget())
 
-        # Toggle Autostart
-        autostart_active = is_autostart_enabled()
-        auto_label = "⚙️ Iniciar con el sistema [✓ Activado]" if autostart_active else "⚙️ Iniciar con el sistema [Desactivado]"
-        item_autostart = Gtk.MenuItem(label=auto_label)
-        item_autostart.connect("activate", self._toggle_autostart)
-        menu.append(item_autostart)
+        btn_refresh = Gtk.Button(label="↻ Actualizar")
+        btn_refresh.get_style_context().add_class("footer-btn")
+        btn_refresh.get_style_context().add_class("btn-refresh")
+        btn_refresh.connect("clicked", lambda _: self.trigger_refresh())
 
-        menu.append(Gtk.SeparatorMenuItem())
-
-        # Salir
-        item_exit = Gtk.MenuItem(label="❌ Salir")
-        item_exit.connect("activate", lambda _: Gtk.main_quit())
-        menu.append(item_exit)
+        footer_box.pack_start(btn_monitor, True, True, 0)
+        footer_box.pack_start(btn_refresh, True, True, 0)
+        footer_item.add(footer_box)
+        menu.append(footer_item)
 
         menu.show_all()
-        self.indicator.set_menu(menu)
+        self.menu = menu
+        if self.indicator:
+            self.indicator.set_menu(menu)
 
     def _make_switch_cb(self, provider: str, account: str):
         def cb(_):
@@ -747,13 +903,175 @@ class PystrayFallbackTray:
             create_image("#10b981"),
             "CLI Account Switch",
             menu=pystray.Menu(
-                pystray.MenuItem("CLI Account Switch", None, enabled=False),
-                pystray.MenuItem("Abrir Monitor Completo", on_open_widget),
-                pystray.MenuItem("Salir", on_exit),
+                pystray.MenuItem("📊 Abrir Monitor", on_open_widget),
+                pystray.MenuItem("↻ Actualizar", lambda icon, item: self.trigger_refresh()),
             ),
         )
 
         icon.run()
+
+
+# ==============================================================================
+# VISTA PREVIA DEL WIDGET INCRUSTADO (--preview y --preview-image)
+# ==============================================================================
+
+def run_preview(output_image: str | None = None):
+    """
+    Despliega una ventana visual idéntica al widget incrustado con datos de ejemplo
+    (3 cuentas Codex, 3 cuentas AGY, barras de progreso, porcentajes semanales en
+    letra reducida y botones de acción en pie lado a lado).
+    Si se proporciona output_image, exporta un archivo PNG del widget y finaliza.
+    """
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk
+
+    success, _ = Gtk.init_check(None)
+    if not success and not output_image:
+        print("⚠️ No se detectó un servidor gráfico activo (DISPLAY no configurado).", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(GTK_CUSTOM_CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            style_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+    except Exception:
+        pass
+
+    win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    win.set_title("Switch · Vista Previa Widget Incrustado")
+    win.set_default_size(360, 520)
+    win.set_resizable(False)
+    win.set_position(Gtk.WindowPosition.CENTER)
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+    vbox.get_style_context().add_class("widget-box")
+
+    def build_preview_card(name, is_act, pct, reset_str, weekly_pct=None, claude_pct=None):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        card.get_style_context().add_class("account-card")
+        if is_act:
+            card.get_style_context().add_class("active")
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        prefix = "★ [ACTIVA]" if is_act else "⚡ Usar"
+        p_color = "#38bdf8" if is_act else "#94a3b8"
+        lbl_name = Gtk.Label()
+        lbl_name.set_markup(f"<span foreground='{p_color}'><b>{prefix}</b></span> <b>{name}</b>")
+        lbl_name.set_xalign(0.0)
+        row.pack_start(lbl_name, True, True, 0)
+
+        if pct is not None:
+            c_color = "#34d399" if pct > 40 else ("#fbbf24" if pct > 15 else "#f87171")
+            lbl_pct = Gtk.Label()
+            lbl_pct.set_markup(f"<span foreground='{c_color}'><b>{pct}%</b> disp</span>")
+            lbl_pct.set_xalign(1.0)
+            row.pack_end(lbl_pct, False, False, 0)
+        card.pack_start(row, False, False, 0)
+
+        if pct is not None:
+            pb = Gtk.ProgressBar()
+            pb.set_fraction(max(0.0, min(1.0, pct / 100.0)))
+            if pct <= 15:
+                pb.get_style_context().add_class("red")
+            elif pct <= 40:
+                pb.get_style_context().add_class("amber")
+            card.pack_start(pb, False, False, 1)
+
+        sub_parts = []
+        if reset_str:
+            sub_parts.append(f"⏳ Resetea en: {reset_str}")
+        if weekly_pct is not None:
+            sub_parts.append(f"📅 Semanal: {weekly_pct}%")
+        if claude_pct is not None:
+            sub_parts.append(f"Claude 3P: {claude_pct}%")
+
+        if sub_parts:
+            lbl_sub = Gtk.Label()
+            sub_text = "   ·   ".join(sub_parts)
+            lbl_sub.set_markup(f"<span size='smaller' foreground='#8b949e'>{sub_text}</span>")
+            lbl_sub.set_xalign(0.0)
+            card.pack_start(lbl_sub, False, False, 0)
+
+        return card
+
+    # 1. CODEX (Top 3)
+    s1 = Gtk.Label()
+    s1.set_markup("<span foreground='#34d399'><b>── 🟢 OPENAI CODEX (3 cuentas) ──</b></span>")
+    s1.set_xalign(0.0)
+    vbox.pack_start(s1, False, False, 4)
+
+    vbox.pack_start(build_preview_card("principal", True, 85, "2h 45m", weekly_pct=72), False, False, 0)
+    vbox.pack_start(build_preview_card("secundaria", False, 42, "4h 10m", weekly_pct=38), False, False, 0)
+    vbox.pack_start(build_preview_card("backup", False, 12, "1h 05m", weekly_pct=15), False, False, 0)
+
+    # 2. AGY (Top 3)
+    s2 = Gtk.Label()
+    s2.set_markup("<span foreground='#a78bfa'><b>── 🟣 GOOGLE AGY (3 cuentas) ──</b></span>")
+    s2.set_xalign(0.0)
+    vbox.pack_start(s2, False, False, 4)
+
+    vbox.pack_start(build_preview_card("trabajo", True, 92, "3h 15m", weekly_pct=85, claude_pct=88), False, False, 0)
+    vbox.pack_start(build_preview_card("personal", False, 60, "4h 50m", weekly_pct=50, claude_pct=45), False, False, 0)
+    vbox.pack_start(build_preview_card("dev-team", False, 18, "0h 40m", weekly_pct=20, claude_pct=15), False, False, 0)
+
+    vbox.pack_start(Gtk.Separator(), False, False, 6)
+
+    # Pie con 2 botones lado a lado
+    footer_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    b_mon = Gtk.Button(label="📊 Abrir Monitor")
+    b_mon.get_style_context().add_class("footer-btn")
+    b_mon.get_style_context().add_class("btn-monitor")
+
+    b_ref = Gtk.Button(label="↻ Actualizar")
+    b_ref.get_style_context().add_class("footer-btn")
+    b_ref.get_style_context().add_class("btn-refresh")
+
+    footer_box.pack_start(b_mon, True, True, 0)
+    footer_box.pack_start(b_ref, True, True, 0)
+    vbox.pack_start(footer_box, False, False, 4)
+
+    win.add(vbox)
+    win.connect("destroy", Gtk.main_quit)
+
+    def on_click_mon(_):
+        print("📊 Abrir Monitor Completo (Widget)...")
+        w_exe = find_module_file("switch-widget")
+        if w_exe:
+            subprocess.Popen([sys.executable, str(w_exe)])
+
+    def on_click_ref(_):
+        print("↻ Actualizando cuotas del widget...")
+
+    b_mon.connect("clicked", on_click_mon)
+    b_ref.connect("clicked", on_click_ref)
+
+    win.show_all()
+
+    if output_image:
+        try:
+            import cairo
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            alloc = win.get_allocation()
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, alloc.width, alloc.height)
+            cr = cairo.Context(surface)
+            win.draw(cr)
+            surface.write_to_png(output_image)
+            print(f"✅ Vista previa PNG generada exitosamente en: {output_image}")
+        except Exception as e:
+            print(f"❌ Error al renderizar imagen de vista previa: {e}", file=sys.stderr)
+        return
+
+    print("Mostrando vista previa del widget incrustado en pantalla. Presiona Ctrl+C o cierra la ventana para salir.")
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        pass
 
 
 # ==============================================================================
@@ -769,8 +1087,15 @@ def main():
     parser.add_argument("--autostart", choices=["enable", "disable", "status"], help="Gestionar auto-inicio al encender la computadora")
     parser.add_argument("--status", action="store_true", help="Consultar estado rápido en la terminal y salir")
     parser.add_argument("--daemon", action="store_true", help="Modo servicio de fondo continuo sin GUI")
+    parser.add_argument("--preview", action="store_true", help="Mostrar ventana de vista previa del widget incrustado con datos de ejemplo")
+    parser.add_argument("--preview-image", type=str, metavar="RUTA", help="Generar imagen PNG con la vista previa del widget incrustado y salir")
 
     args = parser.parse_args()
+
+    # Vista previa interactiva o exportación de imagen
+    if args.preview or args.preview_image:
+        run_preview(output_image=args.preview_image)
+        return
 
     # Gestión de Autostart
     if args.autostart:

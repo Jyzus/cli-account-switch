@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Switch · Vista Previa Widget Incrustado</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --surface: #0d1117;
+      --card-bg: rgba(22, 27, 34, 0.95);
+      --card-active: rgba(26, 32, 44, 0.98);
+      --border: rgba(255, 255, 255, 0.08);
+      --border-active: rgba(99, 102, 241, 0.5);
+      --text: #f0f6fc;
+      --text-muted: #8b949e;
+      --green: #10b981;
+      --green-light: #34d399;
+      --amber: #f59e0b;
+      --amber-light: #fbbf24;
+      --red: #ef4444;
+      --red-light: #f87171;
+      --accent: #4f46e5;
+      --accent-border: #6366f1;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, sans-serif;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 24px 16px;
+    }
+
+    .preview-header {
+      text-align: center;
+      margin-bottom: 20px;
+      max-width: 520px;
+    }
+
+    .preview-header h1 {
+      font-size: 20px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      color: #e2e8f0;
+    }
+
+    .preview-header p {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    .badge-tag {
+      display: inline-block;
+      background: rgba(99, 102, 241, 0.15);
+      color: #818cf8;
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    /* Widget Container */
+    .widget-container {
+      width: 100%;
+      max-width: 380px;
+      background: var(--surface);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px;
+      box-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.7);
+      padding: 14px;
+      overflow: hidden;
+    }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      padding: 6px 4px 4px 4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .section-title.codex {
+      color: var(--green-light);
+    }
+
+    .section-title.agy {
+      color: #a78bfa;
+    }
+
+    .account-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      transition: all 0.15s ease;
+      cursor: pointer;
+    }
+
+    .account-card:hover {
+      background: rgba(33, 38, 45, 0.95);
+      border-color: rgba(255, 255, 255, 0.18);
+    }
+
+    .account-card.active {
+      border-color: var(--border-active);
+      background: var(--card-active);
+    }
+
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 5px;
+    }
+
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .badge-active {
+      color: #38bdf8;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .badge-switch {
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .pct-val {
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .pct-high { color: var(--green-light); }
+    .pct-med { color: var(--amber-light); }
+    .pct-low { color: var(--red-light); }
+
+    /* Progress bar */
+    .progress-track {
+      width: 100%;
+      height: 6px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 5px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+
+    .progress-fill.high { background: var(--green); }
+    .progress-fill.med { background: var(--amber); }
+    .progress-fill.low { background: var(--red); }
+
+    /* Subtitle details */
+    .card-sub {
+      font-size: 10px;
+      color: var(--text-muted);
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      line-height: 1.3;
+    }
+
+    .card-sub span {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+    }
+
+    .card-sub .separator {
+      color: rgba(255, 255, 255, 0.2);
+    }
+
+    .divider {
+      height: 1px;
+      background: rgba(255, 255, 255, 0.08);
+      margin: 10px 0 10px 0;
+    }
+
+    /* Footer: 2 buttons side by side */
+    .footer-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .footer-btn {
+      flex: 1;
+      padding: 8px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.15s ease;
+      text-decoration: none;
+    }
+
+    .btn-monitor {
+      background: var(--accent);
+      color: #ffffff;
+      border-color: var(--accent-border);
+    }
+
+    .btn-monitor:hover {
+      background: #4338ca;
+    }
+
+    .btn-refresh {
+      background: #21262d;
+      color: #c9d1d9;
+      border-color: rgba(255, 255, 255, 0.15);
+    }
+
+    .btn-refresh:hover {
+      background: #30363d;
+      border-color: rgba(255, 255, 255, 0.25);
+    }
+
+    .note-box {
+      margin-top: 18px;
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: center;
+      max-width: 380px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="preview-header">
+    <div class="badge-tag">Switch · Widget Incrustado Mejorado</div>
+    <h1>Vista Previa del Monitor de Bandeja</h1>
+    <p>Diseño ultracompacto con máximo 3 cuentas por proveedor, barras de progreso, porcentajes de reinicio semanal y botones en pie lado a lado.</p>
+  </div>
+
+  <div class="widget-container">
+    <!-- SECCIÓN OPENAI CODEX (TOP 3) -->
+    <div class="section-title codex">── 🟢 OPENAI CODEX (Top 3) ──</div>
+
+    <!-- Cuenta 1 (Activa) -->
+    <div class="account-card active" title="Cuenta activa actual">
+      <div class="card-top">
+        <div class="card-title">
+          <span class="badge-active">★ [ACTIVA]</span>
+          <span>principal</span>
+        </div>
+        <div class="pct-val pct-high">85% disp</div>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill high" style="width: 85%;"></div>
+      </div>
+      <div class="card-sub">
+        <span>⏳ Resetea en: 2h 45m</span>
+        <span class="separator">·</span>
+        <span>📅 Semanal: 72%</span>
+      </div>
+    </div>
+
+    <!-- Cuenta 2 -->
+    <div class="account-card" title="Clic para conmutar a esta cuenta">
+      <div class="card-top">
+        <div class="card-title">
+          <span class="badge-switch">⚡ Usar</span>
+          <span>secundaria</span>
+        </div>
+        <div class="pct-val pct-med">42% disp</div>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill med" style="width: 42%;"></div>
+      </div>
+      <div class="card-sub">
+        <span>⏳ Resetea en: 4h 10m</span>
+        <span class="separator">·</span>
+        <span>📅 Semanal: 38%</span>
+      </div>
+    </div>
+
+    <!-- Cuenta 3 -->
+    <div class="account-card" title="Clic para conmutar a esta cuenta">
+      <div class="card-top">
+        <div class="card-title">
+          <span class="badge-switch">⚡ Usar</span>
+          <span>backup</span>
+        </div>
+        <div class="pct-val pct-low">12% disp</div>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill low" style="width: 12%;"></div>
+      </div>
+      <div class="card-sub">
+        <span>⏳ Resetea en: 1h 05m</span>
+        <span class="separator">·</span>
+        <span>📅 Semanal: 15%</span>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <!-- SECCIÓN GOOGLE ANTIGRAVITY (TOP 3) -->
+    <div class="section-title agy">── 🟣 GOOGLE AGY (Top 3) ──</div>
+
+    <!-- Cuenta 1 (Activa) -->
+    <div class="account-card active" title="Cuenta activa actual">
+      <div class="card-top">
+        <div class="card-title">
+          <span class="badge-active">★ [ACTIVA]</span>
+          <span>trabajo</span>
+        </div>
+        <div class="pct-val pct-high">Gemini 92%</div>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill high" style="width: 92%;"></div>
+      </div>
+      <div class="card-sub">
+        <span>⏳ Resetea en: 3h 15m</span>
+        <span class="separator">·</span>
+        <span>📅 Semanal: 85%</span>
+        <span class="separator">·</span>
+        <span>Claude: 88%</span>
+      </div>
+    </div>
+
+    <!-- Cuenta 2 -->
+    <div class="account-card" title="Clic para conmutar a esta cuenta">
+      <div class="card-top">
+        <div class="card-title">
+          <span class="badge-switch">⚡ Usar</span>
+          <span>personal</span>
+        </div>
+        <div class="pct-val pct-med">Gemini 60%</div>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill med" style="width: 60%;"></div>
+      </div>
+      <div class="card-sub">
+        <span>⏳ Resetea en: 4h 50m</span>
+        <span class="separator">·</span>
+        <span>📅 Semanal: 50%</span>
+        <span class="separator">·</span>
+        <span>Claude: 45%</span>
+      </div>
+    </div>
+
+    <!-- Cuenta 3 -->
+    <div class="account-card" title="Clic para conmutar a esta cuenta">
+      <div class="card-top">
+        <div class="card-title">
+          <span class="badge-switch">⚡ Usar</span>
+          <span>dev-team</span>
+        </div>
+        <div class="pct-val pct-low">Gemini 18%</div>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill low" style="width: 18%;"></div>
+      </div>
+      <div class="card-sub">
+        <span>⏳ Resetea en: 0h 40m</span>
+        <span class="separator">·</span>
+        <span>📅 Semanal: 20%</span>
+        <span class="separator">·</span>
+        <span>Claude: 15%</span>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <!-- PIE: 2 BOTONES LADO A LADO -->
+    <div class="footer-actions">
+      <button class="footer-btn btn-monitor" onclick="alert('Acción: Abre el monitor visual de escritorio completo')">
+        📊 Abrir Monitor
+      </button>
+      <button class="footer-btn btn-refresh" onclick="alert('Acción: Fuerza la actualización de cuotas y tokens en vivo')">
+        ↻ Actualizar
+      </button>
+    </div>
+  </div>
+
+  <div class="note-box">
+    ✓ Sin título truncado ("CLI Accou...")<br />
+    ✓ Sin opciones verticales ("Iniciar con el sistema" / "Salir")<br />
+    ✓ Máximo 3 cuentas por proveedor con barras de progreso y tipografía reducida para semanales.
+  </div>
+
+</body>
+</html>
