@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
 # ==============================================================================
 # CARGA DE MÓDULOS DE CODEX Y AGY
@@ -701,7 +701,7 @@ class FloatingTrayWindow:
     def hide(self):
         self.win.hide()
 
-    def show_at_tray_position(self):
+    def show_at_tray_position(self, x: int = -1, y: int = -1):
         try:
             display = self.Gdk.Display.get_default()
             if display:
@@ -709,19 +709,26 @@ class FloatingTrayWindow:
                 if monitor:
                     geom = monitor.get_geometry()
                     win_w, win_h = 360, 490
-                    pos_x = max(10, geom.x + geom.width - win_w - 18)
-                    pos_y = geom.y + 36
+                    if x > 0 and y > 0:
+                        pos_x = min(geom.x + geom.width - win_w - 12, max(geom.x + 10, x - win_w // 2))
+                        if y < geom.y + geom.height // 2:
+                            pos_y = max(geom.y + 30, y + 8)
+                        else:
+                            pos_y = max(geom.y + 10, y - win_h - 8)
+                    else:
+                        pos_x = max(10, geom.x + geom.width - win_w - 18)
+                        pos_y = geom.y + 36
                     self.win.move(pos_x, pos_y)
         except Exception:
             pass
         self.win.show_all()
         self.win.present()
 
-    def toggle(self):
+    def toggle(self, x: int = -1, y: int = -1):
         if self.is_visible():
             self.hide()
         else:
-            self.show_at_tray_position()
+            self.show_at_tray_position(x, y)
 
     def update_data(self, status: dict):
         self.current_data = status
@@ -885,6 +892,135 @@ class FloatingTrayWindow:
         return ev
 
 
+# ==============================================================================
+# IMPLEMENTACIÓN NATIVA STATUS NOTIFIER ITEM (D-BUS / FREEDESKTOP)
+# ==============================================================================
+
+SNI_DBUS_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <method name="Activate">
+      <arg direction="in" type="i" name="x"/>
+      <arg direction="in" type="i" name="y"/>
+    </method>
+    <method name="SecondaryActivate">
+      <arg direction="in" type="i" name="x"/>
+      <arg direction="in" type="i" name="y"/>
+    </method>
+    <method name="ContextMenu">
+      <arg direction="in" type="i" name="x"/>
+      <arg direction="in" type="i" name="y"/>
+    </method>
+    <signal name="NewIcon"/>
+    <signal name="NewTitle"/>
+    <signal name="NewStatus">
+      <arg type="s" name="status"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+
+class DbusStatusNotifierItem:
+    """
+    Servicio StatusNotifierItem en D-Bus con ItemIsMenu=False.
+    Permite que en entornos modernos (GNOME Shell, KDE Plasma, XFCE) el clic
+    directo en el icono de la barra de tareas invoque directamente Activate(x, y),
+    desplegando la ventana flotante estética al presionar el icono incrustado sin
+    abrir menús contextuales intermediarios.
+    """
+    def __init__(self, on_activate, title="Switch", icon_name="utilities-system-monitor"):
+        self.on_activate = on_activate
+        self.title = title
+        self.icon_name = icon_name
+        self.icon_theme_path = str(Path.home() / ".local" / "share" / "icons" / "cli-account-switch")
+        self.bus = None
+
+    def start(self):
+        from gi.repository import Gio, GLib
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            node_info = Gio.DBusNodeInfo.new_for_xml(SNI_DBUS_XML)
+            iface_info = node_info.lookup_interface("org.kde.StatusNotifierItem")
+
+            def handle_method_call(conn, sender, path, iface, method, params, invocation):
+                x, y = params.unpack() if params else (-1, -1)
+                if self.on_activate:
+                    GLib.idle_add(lambda: self.on_activate(x, y))
+                invocation.return_value(None)
+
+            def handle_get_property(conn, sender, path, iface, prop):
+                props = {
+                    "Category": GLib.Variant("s", "ApplicationStatus"),
+                    "Id": GLib.Variant("s", "cli-account-switch"),
+                    "Title": GLib.Variant("s", self.title),
+                    "Status": GLib.Variant("s", "Active"),
+                    "IconName": GLib.Variant("s", self.icon_name),
+                    "IconThemePath": GLib.Variant("s", self.icon_theme_path),
+                    "ItemIsMenu": GLib.Variant("b", False),
+                }
+                return props.get(prop)
+
+            self.bus.register_object(
+                "/StatusNotifierItem",
+                iface_info,
+                handle_method_call,
+                handle_get_property,
+                None,
+            )
+
+            service_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+            Gio.bus_own_name(
+                Gio.BusType.SESSION,
+                service_name,
+                Gio.BusNameOwnerFlags.NONE,
+                None,
+                lambda conn, name: self._on_name_acquired(conn, name),
+                None,
+            )
+        except Exception:
+            pass
+
+    def _on_name_acquired(self, conn, name):
+        from gi.repository import Gio, GLib
+        try:
+            conn.call_sync(
+                "org.kde.StatusNotifierWatcher",
+                "/StatusNotifierWatcher",
+                "org.kde.StatusNotifierWatcher",
+                "RegisterStatusNotifierItem",
+                GLib.Variant("(s)", (name,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                500,
+                None,
+            )
+        except Exception:
+            pass
+
+    def update_icon(self, icon_name: str, title: str):
+        self.icon_name = icon_name
+        self.title = title
+        if self.bus:
+            try:
+                self.bus.emit_signal(
+                    None,
+                    "/StatusNotifierItem",
+                    "org.kde.StatusNotifierItem",
+                    "NewIcon",
+                    None,
+                )
+            except Exception:
+                pass
+
+
 class LinuxAppIndicatorTray:
     def __init__(self, interval: int = 300):
         self.interval = max(30, interval)
@@ -892,6 +1028,7 @@ class LinuxAppIndicatorTray:
         self.current_status: dict = {}
         self.indicator = None
         self.popover = None
+        self.sni = None
         self.Gtk = None
         self.GLib = None
 
@@ -944,10 +1081,17 @@ class LinuxAppIndicatorTray:
             on_refresh=self.trigger_refresh,
         )
 
+        # Iniciar servicio StatusNotifierItem con ItemIsMenu=False para activación directa al presionar icono
+        try:
+            self.sni = DbusStatusNotifierItem(on_activate=lambda x, y: self.popover.toggle(x, y))
+            self.sni.start()
+        except Exception:
+            pass
+
         # Manejador de señal para alternar ventana flotante desde CLI (SIGUSR1)
         if hasattr(signal, "SIGUSR1"):
             try:
-                signal.signal(signal.SIGUSR1, lambda s, f: self.GLib.idle_add(self.popover.toggle))
+                signal.signal(signal.SIGUSR1, lambda s, f: self.GLib.idle_add(lambda: self.popover.toggle(-1, -1)))
             except Exception:
                 pass
 
@@ -963,6 +1107,23 @@ class LinuxAppIndicatorTray:
         # Construir menú inicial
         self.menu = Gtk.Menu()
         self.indicator.set_menu(self.menu)
+
+        # Interceptar clic directo en el icono del tray mediante about-to-show y secondary_activate
+        try:
+            dbus_server = self.indicator.get_property("dbus-menu-server")
+            if dbus_server:
+                root_node = dbus_server.get_property("root-node")
+                if root_node:
+                    root_node.connect("about-to-show", lambda _: self.GLib.idle_add(lambda: self.popover.toggle(-1, -1)))
+        except Exception:
+            pass
+
+        try:
+            dummy_target = Gtk.MenuItem()
+            dummy_target.connect("activate", lambda _: self.GLib.idle_add(lambda: self.popover.toggle(-1, -1)))
+            self.indicator.set_secondary_activate_target(dummy_target)
+        except Exception:
+            pass
 
         # Iniciar hilo de recolección en segundo plano
         t = threading.Thread(target=self._worker_loop, daemon=True)
@@ -1021,6 +1182,13 @@ class LinuxAppIndicatorTray:
 
         icon_path = self.icons.get(icon_key, "utilities-system-monitor")
         self.indicator.set_icon_full(icon_path, panel_text)
+
+        # Actualizar icono en el servicio D-Bus StatusNotifierItem
+        if self.sni:
+            try:
+                self.sni.update_icon(icon_path, panel_text)
+            except Exception:
+                pass
 
         # Actualizar datos en la ventana flotante
         if self.popover:

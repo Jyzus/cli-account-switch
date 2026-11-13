@@ -146,3 +146,48 @@ print('OK_POPOVER')
     p = subprocess.run(cmd, capture_output=True, text=True)
     assert p.returncode == 0, f"Error en test_floating_popover_structure: {p.stderr}\n{p.stdout}"
     assert "OK_POPOVER" in p.stdout
+
+
+def test_sni_direct_click_activation():
+    """Verifica que el servicio D-Bus StatusNotifierItem configure ItemIsMenu=False para clic directo."""
+    cmd = [
+        "xvfb-run", "-a", sys.executable, "-c",
+        f"""
+import sys, threading, time
+from importlib.machinery import SourceFileLoader
+mod = SourceFileLoader('switch_tray', '{str(TRAY_PATH)}').load_module()
+from gi.repository import Gio, GLib
+
+called = []
+sni = mod.DbusStatusNotifierItem(on_activate=lambda x, y: called.append((x, y)))
+sni.start()
+
+loop = GLib.MainLoop()
+result = []
+
+def worker():
+    time.sleep(0.05)
+    c_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    prop = c_bus.call_sync(
+        sni.bus.get_unique_name(),
+        '/StatusNotifierItem',
+        'org.freedesktop.DBus.Properties',
+        'Get',
+        GLib.Variant('(ss)', ('org.kde.StatusNotifierItem', 'ItemIsMenu')),
+        GLib.VariantType('(v)'),
+        Gio.DBusCallFlags.NONE,
+        1000,
+        None
+    )
+    result.append(prop[0])
+    loop.quit()
+
+threading.Thread(target=worker, daemon=True).start()
+loop.run()
+assert result and result[0] == False, f'ItemIsMenu debe ser False para activacion directa, pero es {{result}}'
+print('OK_SNI')
+"""
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    assert p.returncode == 0, f"Error en test_sni_direct_click_activation: {p.stderr}\n{p.stdout}"
+    assert "OK_SNI" in p.stdout
