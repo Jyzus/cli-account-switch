@@ -102,7 +102,7 @@ if [ -x "$INSTALL_DIR/switch-tray" ]; then
     printf '   Auto-inicio en barra de tareas activado (switch-tray --autostart enable)\n'
 fi
 
-printf '✅ Instalados switch, codex-switch, agy-switch, switch-widget y switch-tray (v1.2.5) en %s\n' "$INSTALL_DIR"
+printf '✅ Instalados switch, codex-switch, agy-switch, switch-widget y switch-tray (v1.2.6) en %s\n' "$INSTALL_DIR"
 case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *) printf '💡 Añade este directorio a tu PATH: export PATH="%s:\$PATH"\n' "$INSTALL_DIR" ;;

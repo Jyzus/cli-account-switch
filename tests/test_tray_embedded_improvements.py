@@ -23,21 +23,30 @@ def test_preview_image_generation(tmp_path):
     assert out_png.stat().st_size > 1000
 
 
-def test_menu_structure_and_no_title_or_exit():
-    """Verifica que el menú no incluya el título truncable, ni 'Iniciar con el sistema', ni 'Salir'."""
-    try:
-        import gi
-        gi.require_version("Gtk", "3.0")
-        from gi.repository import Gtk
-    except Exception:
-        pytest.skip("GTK 3 no disponible en este entorno")
+def test_format_account_label():
+    """Verifica la lógica de formateo para Codex y AGY con prefijos de activación."""
+    # Codex activo
+    c_act = {"name": "principal", "is_active": True, "available_pct": 85, "weekly_pct": 72}
+    assert tray_mod.format_account_label("codex", c_act) == "✓ principal · 85% | 72% sem"
 
-    success, _ = Gtk.init_check(None)
-    if not success:
-        # En entorno sin X11/Wayland activo fuera de xvfb, probar en subproceso
-        cmd = [
-            "xvfb-run", "-a", sys.executable, "-c",
-            f"""
+    # Codex inactivo
+    c_inact = {"name": "backup", "is_active": False, "available_pct": 40, "weekly_pct": 30}
+    assert tray_mod.format_account_label("codex", c_inact) == "  backup · 40% | 30% sem"
+
+    # AGY activo
+    a_act = {"name": "trabajo", "is_active": True, "gemini_pct": 90, "claude_pct": 80}
+    assert tray_mod.format_account_label("agy", a_act) == "✓ trabajo · 90% | 80% sem"
+
+    # AGY con error
+    a_err = {"name": "dev", "is_active": False, "error": "Token vencido"}
+    assert tray_mod.format_account_label("agy", a_err) == "  dev · ⚠️ Token vencido"
+
+
+def test_menu_structure_and_no_title_or_exit():
+    """Verifica la estructura limpia del menú nativo: encabezados centrados, 3 cuentas max y único botón."""
+    cmd = [
+        "xvfb-run", "-a", sys.executable, "-c",
+        f"""
 import sys
 from importlib.machinery import SourceFileLoader
 mod = SourceFileLoader('switch_tray', '{str(TRAY_PATH)}').load_module()
@@ -47,147 +56,67 @@ from gi.repository import Gtk
 
 tray = mod.LinuxAppIndicatorTray()
 tray.current_status = {{
-    'codex': {{'accounts': [{{'name': f'c{{i}}', 'is_active': (i==0), 'available_pct': 80, 'weekly_pct': 60, 'reset_str': '2h'}} for i in range(5)], 'all_accounts': [f'c{{i}}' for i in range(5)]}},
-    'agy': {{'accounts': [{{'name': f'a{{i}}', 'is_active': (i==0), 'gemini_pct': 90, 'claude_pct': 85, 'reset_str': '3h'}} for i in range(5)], 'all_accounts': [f'a{{i}}' for i in range(5)]}}
+    'codex': {{
+        'accounts': [
+            {{'name': f'c{{i}}', 'is_active': (i==0), 'available_pct': 80 - i*10, 'weekly_pct': 60, 'reset_str': '2h'}}
+            for i in range(5)
+        ],
+        'all_accounts': [f'c{{i}}' for i in range(5)]
+    }},
+    'agy': {{
+        'accounts': [
+            {{'name': f'a{{i}}', 'is_active': (i==0), 'gemini_pct': 90 - i*10, 'claude_pct': 85, 'reset_str': '3h'}}
+            for i in range(5)
+        ],
+        'all_accounts': [f'a{{i}}' for i in range(5)]
+    }}
 }}
 tray._rebuild_menu()
 children = tray.menu.get_children()
 
-# 1. Verificar que NO hay título 'CLI Account Switch'
-labels = []
-for c in children:
-    if hasattr(c, 'get_label') and c.get_label():
-        labels.append(c.get_label())
+labels = [c.get_label() for c in children if hasattr(c, 'get_label') and c.get_label()]
 
+# 1. Sin títulos truncables ni opciones de autostart/salir
 assert not any('CLI Account Switch' in l for l in labels), f'Título encontrado en: {{labels}}'
-
-# 2. Verificar que NO hay autostart ni salir
 assert not any('Iniciar con el sistema' in l for l in labels), f'Autostart encontrado en: {{labels}}'
 assert not any('Salir' in l for l in labels), f'Salir encontrado en: {{labels}}'
+assert not any('Actualizar' in l for l in labels), f'Actualizar encontrado en: {{labels}}'
 
-# 3. Verificar que el pie contiene los dos botones lado a lado
-footer = children[-1]
-f_box = footer.get_children()[0]
-assert isinstance(f_box, Gtk.Box)
-assert f_box.get_orientation() == Gtk.Orientation.HORIZONTAL
-buttons = [b for b in f_box.get_children() if isinstance(b, Gtk.Button)]
-assert len(buttons) == 2
-btn_labels = [b.get_label() for b in buttons]
-assert '📊 Abrir Monitor' in btn_labels[0]
-assert '↻ Actualizar' in btn_labels[1]
-print('OK')
+# 2. Encabezados centrados presentes
+assert '--------- Codex ---------' in labels
+assert '---------- AGY ----------' in labels
+
+# 3. Solo 3 cuentas por proveedor (total 6 ítems de cuenta)
+codex_items = [l for l in labels if l.startswith('✓ c') or l.startswith('  c')]
+agy_items = [l for l in labels if l.startswith('✓ a') or l.startswith('  a')]
+assert len(codex_items) == 3, f'Esperadas 3 cuentas codex, obtenidas: {{codex_items}}'
+assert len(agy_items) == 3, f'Esperadas 3 cuentas agy, obtenidas: {{agy_items}}'
+
+# 4. Chequeo de activo/inactivo
+assert codex_items[0].startswith('✓ c0 · ')
+assert codex_items[1].startswith('  c1 · ')
+
+# 5. Único botón extra en el pie
+last_item = [c for c in children if hasattr(c, 'get_label') and c.get_label()][-1]
+assert last_item.get_label() == '📊 Abrir Monitor'
+print('OK_MENU')
 """
-        ]
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        assert p.returncode == 0, f"Error en verificación de menú: {p.stderr}\n{p.stdout}"
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    assert p.returncode == 0, f"Error en verificación de menú: {p.stderr}\n{p.stdout}"
+    assert "OK_MENU" in p.stdout
 
 
 def test_tray_daemon_lifecycle():
     """Verifica comandos de gestión de ciclo de vida en segundo plano (start/stop/status)."""
-    # 1. 'switch-tray stop' cuando no está corriendo
     p_stop = subprocess.run([sys.executable, str(TRAY_PATH), "stop"], capture_output=True, text=True)
     assert p_stop.returncode == 0
     assert "no estaba en ejecución" in p_stop.stdout
 
-    # 2. 'switch-tray --help' muestra acciones y opción de primer plano
     p_help = subprocess.run([sys.executable, str(TRAY_PATH), "--help"], capture_output=True, text=True)
     assert p_help.returncode == 0
     assert "start" in p_help.stdout
     assert "stop" in p_help.stdout
     assert "restart" in p_help.stdout
-    assert "show" in p_help.stdout or "popover" in p_help.stdout
+    assert "--preview-image" in p_help.stdout
     assert "--foreground" in p_help.stdout or "-f" in p_help.stdout
-
-
-def test_floating_popover_structure():
-    """Verifica que FloatingTrayWindow renderice la estructura estética de ventana flotante."""
-    cmd = [
-        "xvfb-run", "-a", sys.executable, "-c",
-        f"""
-import sys
-from importlib.machinery import SourceFileLoader
-mod = SourceFileLoader('switch_tray', '{str(TRAY_PATH)}').load_module()
-import gi
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk
-
-popover = mod.FloatingTrayWindow()
-assert not popover.win.get_decorated(), 'La ventana flotante debe ser sin marco (undecorated)'
-
-demo_data = {{
-    'codex': {{
-        'accounts': [
-            {{'name': f'c{{i}}', 'is_active': (i==0), 'available_pct': 85 - i*10, 'weekly_pct': 70, 'reset_str': '2h'}}
-            for i in range(5)
-        ]
-    }},
-    'agy': {{
-        'accounts': [
-            {{'name': f'a{{i}}', 'is_active': (i==0), 'gemini_pct': 90 - i*15, 'claude_pct': 80, 'reset_str': '3h'}}
-            for i in range(5)
-        ]
-    }}
-}}
-popover.update_data(demo_data)
-
-# 1. Comprobar que solo hay como maximo 3 cuentas por proveedor en el contenedor
-cards = [c for c in popover.content_box.get_children() if isinstance(c, Gtk.EventBox)]
-assert len(cards) == 6, f'Deben mostrarse 3 cuentas de Codex y 3 de AGY (total 6), pero hay {{len(cards)}}'
-
-# 2. Comprobar que el footer tiene los 2 botones horizontales
-footer_btns = [b for b in popover.footer_box.get_children() if isinstance(b, Gtk.Button)]
-assert len(footer_btns) == 2
-btn_labels = [b.get_label() for b in footer_btns]
-assert '📊 Abrir Monitor' in btn_labels[0]
-assert '↻ Actualizar' in btn_labels[1]
-print('OK_POPOVER')
-"""
-    ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    assert p.returncode == 0, f"Error en test_floating_popover_structure: {p.stderr}\n{p.stdout}"
-    assert "OK_POPOVER" in p.stdout
-
-
-def test_sni_direct_click_activation():
-    """Verifica que el servicio D-Bus StatusNotifierItem configure ItemIsMenu=False para clic directo."""
-    cmd = [
-        "xvfb-run", "-a", sys.executable, "-c",
-        f"""
-import sys, threading, time
-from importlib.machinery import SourceFileLoader
-mod = SourceFileLoader('switch_tray', '{str(TRAY_PATH)}').load_module()
-from gi.repository import Gio, GLib
-
-called = []
-sni = mod.DbusStatusNotifierItem(on_activate=lambda x, y: called.append((x, y)))
-sni.start()
-
-loop = GLib.MainLoop()
-result = []
-
-def worker():
-    time.sleep(0.05)
-    c_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-    prop = c_bus.call_sync(
-        sni.bus.get_unique_name(),
-        '/StatusNotifierItem',
-        'org.freedesktop.DBus.Properties',
-        'Get',
-        GLib.Variant('(ss)', ('org.kde.StatusNotifierItem', 'ItemIsMenu')),
-        GLib.VariantType('(v)'),
-        Gio.DBusCallFlags.NONE,
-        1000,
-        None
-    )
-    result.append(prop[0])
-    loop.quit()
-
-threading.Thread(target=worker, daemon=True).start()
-loop.run()
-assert result and result[0] == False, f'ItemIsMenu debe ser False para activacion directa, pero es {{result}}'
-print('OK_SNI')
-"""
-    ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    assert p.returncode == 0, f"Error en test_sni_direct_click_activation: {p.stderr}\n{p.stdout}"
-    assert "OK_SNI" in p.stdout
