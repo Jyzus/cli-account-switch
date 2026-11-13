@@ -9,9 +9,11 @@ Bajo consumo de recursos (0% CPU en reposo, ~15MB RAM).
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -21,7 +23,7 @@ from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 # ==============================================================================
 # CARGA DE MÓDULOS DE CODEX Y AGY
@@ -135,6 +137,73 @@ def disable_autostart() -> bool:
     except Exception as e:
         print(f"Error al deshabilitar autostart: {e}", file=sys.stderr)
         return False
+
+
+# ==============================================================================
+# GESTIÓN DE PROCESO EN SEGUNDO PLANO Y PID
+# ==============================================================================
+
+def get_pid_file() -> Path:
+    run_dir = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+    uid_str = str(os.getuid()) if hasattr(os, "getuid") else "user"
+    return run_dir / f"switch-tray-{uid_str}.pid"
+
+
+def is_pid_alive(pid: int) -> bool:
+    try:
+        stat_file = f"/proc/{pid}/status"
+        if os.path.isfile(stat_file):
+            with open(stat_file) as f:
+                content = f.read()
+            if "State:\tZ" in content:
+                return False
+            return True
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, FileNotFoundError):
+        return False
+    except PermissionError:
+        return True
+
+
+def get_running_pid() -> int | None:
+    pf = get_pid_file()
+    if not pf.is_file():
+        return None
+    try:
+        pid = int(pf.read_text().strip())
+        if is_pid_alive(pid):
+            return pid
+        try:
+            pf.unlink()
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+
+def stop_running_instance() -> bool:
+    pid = get_running_pid()
+    if not pid:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(25):
+            if not is_pid_alive(pid):
+                break
+            time.sleep(0.04)
+        if is_pid_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+    pf = get_pid_file()
+    if pf.is_file():
+        try:
+            pf.unlink()
+        except Exception:
+            pass
+    return True
 
 
 # ==============================================================================
@@ -1082,22 +1151,48 @@ def main():
     parser = argparse.ArgumentParser(
         description="CLI Account Switch · Taskbar Widget (Monitor de tokens en barra de tareas con bajo consumo)"
     )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["start", "stop", "restart", "status"],
+        default=None,
+        help="Acción a realizar: start (por defecto, en 2º plano), stop, restart o status",
+    )
     parser.add_argument("-v", "--version", action="version", version=f"CLI Account Switch Taskbar Widget v{VERSION}")
     parser.add_argument("-i", "--interval", type=int, default=300, help="Intervalo de consulta en segundos (por defecto 300s = 5 min)")
     parser.add_argument("--autostart", choices=["enable", "disable", "status"], help="Gestionar auto-inicio al encender la computadora")
     parser.add_argument("--status", action="store_true", help="Consultar estado rápido en la terminal y salir")
-    parser.add_argument("--daemon", action="store_true", help="Modo servicio de fondo continuo sin GUI")
+    parser.add_argument("--stop", action="store_true", help="Detener cualquier instancia activa del widget de bandeja")
+    parser.add_argument("--restart", action="store_true", help="Reiniciar el widget de bandeja en segundo plano")
+    parser.add_argument("-f", "--foreground", action="store_true", help="Ejecutar en primer plano vinculado a la terminal (depuración)")
+    parser.add_argument("--internal-run", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--daemon", action="store_true", help="Modo servicio de fondo continuo")
     parser.add_argument("--preview", action="store_true", help="Mostrar ventana de vista previa del widget incrustado con datos de ejemplo")
     parser.add_argument("--preview-image", type=str, metavar="RUTA", help="Generar imagen PNG con la vista previa del widget incrustado y salir")
 
     args = parser.parse_args()
 
-    # Vista previa interactiva o exportación de imagen
+    # 1. Vista previa interactiva o exportación de imagen
     if args.preview or args.preview_image:
         run_preview(output_image=args.preview_image)
         return
 
-    # Gestión de Autostart
+    # 2. Detener proceso en segundo plano (stop)
+    if args.action == "stop" or args.stop:
+        stopped = stop_running_instance()
+        if stopped:
+            print("✅ Widget de barra de tareas detenido correctamente.")
+        else:
+            print("ℹ️ El widget de barra de tareas no estaba en ejecución.")
+        return
+
+    # 3. Reiniciar (restart)
+    if args.action == "restart" or args.restart:
+        stopped = stop_running_instance()
+        if stopped:
+            print("🔄 Instancia previa detenida.")
+
+    # 4. Gestión de Autostart
     if args.autostart:
         if args.autostart == "enable":
             ok = enable_autostart()
@@ -1118,8 +1213,8 @@ def main():
             print(f"Archivo de configuración: {get_autostart_path()}")
         return
 
-    # Consulta rápida en terminal (Separada por proveedor, max 3 cuentas, actual + semanal + recarga)
-    if args.status:
+    # 5. Consulta rápida en terminal (status)
+    if args.action == "status" or args.status:
         data = fetch_tray_status()
         codex = data.get("codex", {})
         agy = data.get("agy", {})
@@ -1174,28 +1269,95 @@ def main():
                 print(f"              • Gemini Models (5h)  : \033[1m{g_pct}%\033[0m disp · {g_used}% usado (resetea en: {g_res})")
                 print(f"              • Claude 3P / Semanal : \033[1m{c_pct}%\033[0m disp · {c_used}% usado (resetea en: {c_res})")
 
-        print(f"\n  • Auto-inicio al encender PC: {'\033[1;32mHABILITADO\033[0m' if is_autostart_enabled() else '\033[1;33mDESHABILITADO\033[0m'}\n")
+        running_pid = get_running_pid()
+        st_proc = f"\033[1;32mACTIVO\033[0m (PID: {running_pid})" if running_pid else "\033[1;33mDETENIDO\033[0m"
+        print(f"\n  • Estado del widget de bandeja: {st_proc}")
+        print(f"  • Auto-inicio al encender PC  : {'\033[1;32mHABILITADO\033[0m' if is_autostart_enabled() else '\033[1;33mDESHABILITADO\033[0m'}\n")
         return
 
-    # Iniciar en modo barra de tareas
-    print("Iniciando widget en la barra de tareas / system tray...")
-    print(f"  • Intervalo de chequeo: {args.interval}s")
-    print(f"  • Auto-inicio con el sistema: {'Activado' if is_autostart_enabled() else 'Desactivado'}")
+    # 6. Modo interno (Worker desvinculado en segundo plano)
+    if args.internal_run:
+        pid_file = get_pid_file()
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(str(os.getpid()))
+        atexit.register(lambda: pid_file.unlink(missing_ok=True) if pid_file.is_file() else None)
 
-    # En Linux: AppIndicator
-    if not sys.platform.startswith("win") and sys.platform != "darwin":
-        tray = LinuxAppIndicatorTray(interval=args.interval)
-        try:
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+        if not sys.platform.startswith("win") and sys.platform != "darwin":
+            tray = LinuxAppIndicatorTray(interval=args.interval)
             tray.start()
-        except KeyboardInterrupt:
-            print("\nCerrando widget de bandeja...")
+        else:
+            tray = PystrayFallbackTray(interval=args.interval)
+            tray.start()
+        return
+
+    # 7. Modo en primer plano (adjunto a la terminal si se especifica -f/--foreground)
+    if args.foreground:
+        pid_file = get_pid_file()
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(str(os.getpid()))
+        atexit.register(lambda: pid_file.unlink(missing_ok=True) if pid_file.is_file() else None)
+
+        print("Iniciando widget en la barra de tareas en PRIMER PLANO...")
+        print(f"  • Intervalo de chequeo: {args.interval}s")
+        print(f"  • Auto-inicio con el sistema: {'Activado' if is_autostart_enabled() else 'Desactivado'}")
+        print("  💡 (Para ejecutar en segundo plano y poder cerrar la terminal, usa: switch tray)")
+
+        if not sys.platform.startswith("win") and sys.platform != "darwin":
+            tray = LinuxAppIndicatorTray(interval=args.interval)
+            try:
+                tray.start()
+            except KeyboardInterrupt:
+                print("\nCerrando widget de bandeja...")
+        else:
+            tray = PystrayFallbackTray(interval=args.interval)
+            try:
+                tray.start()
+            except KeyboardInterrupt:
+                print("\nCerrando widget de bandeja...")
+        return
+
+    # 8. MODO PREDETERMINADO: Inicio en segundo plano desvinculado (Daemon)
+    running_pid = get_running_pid()
+    if running_pid:
+        print(f"ℹ️ El widget de barra de tareas ya está activo en segundo plano (PID: \033[1;32m{running_pid}\033[0m).")
+        print("   • Para reiniciarlo: \033[1;33mswitch tray restart\033[0m")
+        print("   • Para detenerlo  : \033[1;31mswitch tray stop\033[0m")
+        return
+
+    script_path = Path(__file__).resolve()
+    cmd = [sys.executable, str(script_path), "--internal-run", "-i", str(args.interval)]
+
+    if sys.platform.startswith("win"):
+        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
     else:
-        # Windows / macOS fallback con pystray
-        tray = PystrayFallbackTray(interval=args.interval)
-        try:
-            tray.start()
-        except KeyboardInterrupt:
-            print("\nCerrando widget de bandeja...")
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    get_pid_file().write_text(str(proc.pid))
+    print("╭─────────────────────────────────────────────────────────────╮")
+    print("│  ✦ CLI Account Switch · Widget de Barra de Tareas           │")
+    print("╰─────────────────────────────────────────────────────────────╯")
+    print(f"  ✅ Widget incrustado iniciado en segundo plano (PID: \033[1;32m{proc.pid}\033[0m).")
+    print("  🔒 \033[1mPermanecerá activo en tu panel aunque cierres esta terminal.\033[0m\n")
+    print("  • Para consultar estado : \033[1;36mswitch tray status\033[0m")
+    print("  • Para reiniciar        : \033[1;33mswitch tray restart\033[0m")
+    print("  • Para detener          : \033[1;31mswitch tray stop\033[0m")
+    print(f"  • Inicio con el sistema : {'\033[1;32mActivado\033[0m' if is_autostart_enabled() else '\033[1;33mDesactivado\033[0m (usa: switch tray --autostart enable)'}\n")
 
 
 if __name__ == "__main__":

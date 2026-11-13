@@ -80,3 +80,19 @@ print('OK')
         ]
         p = subprocess.run(cmd, capture_output=True, text=True)
         assert p.returncode == 0, f"Error en verificación de menú: {p.stderr}\n{p.stdout}"
+
+
+def test_tray_daemon_lifecycle():
+    """Verifica comandos de gestión de ciclo de vida en segundo plano (start/stop/status)."""
+    # 1. 'switch-tray stop' cuando no está corriendo
+    p_stop = subprocess.run([sys.executable, str(TRAY_PATH), "stop"], capture_output=True, text=True)
+    assert p_stop.returncode == 0
+    assert "no estaba en ejecución" in p_stop.stdout
+
+    # 2. 'switch-tray --help' muestra acciones y opción de primer plano
+    p_help = subprocess.run([sys.executable, str(TRAY_PATH), "--help"], capture_output=True, text=True)
+    assert p_help.returncode == 0
+    assert "start" in p_help.stdout
+    assert "stop" in p_help.stdout
+    assert "restart" in p_help.stdout
+    assert "--foreground" in p_help.stdout or "-f" in p_help.stdout

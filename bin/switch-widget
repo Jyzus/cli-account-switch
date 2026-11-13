@@ -23,7 +23,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 # ==============================================================================
 # CARGA DE MÓDULOS DE CODEX Y AGY

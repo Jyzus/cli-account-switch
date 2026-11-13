@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 GITHUB_REPO = "Jyzus/cli-account-switch"
 INSTALL_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
 
@@ -664,7 +664,7 @@ def main():
     elif args[0] in ("ayuda", "help", "--help", "-h"):
         print("Uso: switch [comando] [argumentos]")
         print("\nComandos unificados de la suite:")
-        print("  tray                        Inicia el widget en la barra de tareas / system tray")
+        print("  tray [start|stop|restart]   Inicia o gestiona el widget en la barra de tareas (en 2º plano)")
         print("  tray --autostart enable     Ancla el widget para que inicie automáticamente con el PC")
         print("  widget                      Abre el monitor gráfico de escritorio (dashboard)")
         print("  status [nombre]             Consulta cuotas y tokens en vivo de Codex y AGY")
