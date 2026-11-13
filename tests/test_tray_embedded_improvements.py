@@ -95,4 +95,54 @@ def test_tray_daemon_lifecycle():
     assert "start" in p_help.stdout
     assert "stop" in p_help.stdout
     assert "restart" in p_help.stdout
+    assert "show" in p_help.stdout or "popover" in p_help.stdout
     assert "--foreground" in p_help.stdout or "-f" in p_help.stdout
+
+
+def test_floating_popover_structure():
+    """Verifica que FloatingTrayWindow renderice la estructura estética de ventana flotante."""
+    cmd = [
+        "xvfb-run", "-a", sys.executable, "-c",
+        f"""
+import sys
+from importlib.machinery import SourceFileLoader
+mod = SourceFileLoader('switch_tray', '{str(TRAY_PATH)}').load_module()
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk
+
+popover = mod.FloatingTrayWindow()
+assert not popover.win.get_decorated(), 'La ventana flotante debe ser sin marco (undecorated)'
+
+demo_data = {{
+    'codex': {{
+        'accounts': [
+            {{'name': f'c{{i}}', 'is_active': (i==0), 'available_pct': 85 - i*10, 'weekly_pct': 70, 'reset_str': '2h'}}
+            for i in range(5)
+        ]
+    }},
+    'agy': {{
+        'accounts': [
+            {{'name': f'a{{i}}', 'is_active': (i==0), 'gemini_pct': 90 - i*15, 'claude_pct': 80, 'reset_str': '3h'}}
+            for i in range(5)
+        ]
+    }}
+}}
+popover.update_data(demo_data)
+
+# 1. Comprobar que solo hay como maximo 3 cuentas por proveedor en el contenedor
+cards = [c for c in popover.content_box.get_children() if isinstance(c, Gtk.EventBox)]
+assert len(cards) == 6, f'Deben mostrarse 3 cuentas de Codex y 3 de AGY (total 6), pero hay {{len(cards)}}'
+
+# 2. Comprobar que el footer tiene los 2 botones horizontales
+footer_btns = [b for b in popover.footer_box.get_children() if isinstance(b, Gtk.Button)]
+assert len(footer_btns) == 2
+btn_labels = [b.get_label() for b in footer_btns]
+assert '📊 Abrir Monitor' in btn_labels[0]
+assert '↻ Actualizar' in btn_labels[1]
+print('OK_POPOVER')
+"""
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    assert p.returncode == 0, f"Error en test_floating_popover_structure: {p.stderr}\n{p.stdout}"
+    assert "OK_POPOVER" in p.stdout
