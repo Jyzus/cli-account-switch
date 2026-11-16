@@ -1432,7 +1432,7 @@ def cmd_cuentas_json() -> dict:
             "estado": "disponible"
         })
     return {
-        "disponible": True,
+        "disponible": bool(accounts),
         "perfil_activo": active_profile,
         "cuentas": accounts
     }

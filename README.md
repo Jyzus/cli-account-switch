@@ -1,6 +1,6 @@
 # CLI Account Switch
 
-Gestores de perfiles locales para **Codex CLI** (`codex-switch`), **Antigravity CLI** (`agy-switch`) y **OpenCode** (`opencode-switch`), acompañados de un **Widget de Barra de Tareas / Bandeja del Sistema ultraligero** (`switch-tray`) y un **Desktop Dashboard flotante** (`switch-widget`). Guarda una autenticación con un alias, cambia de perfil en 1 clic, monitorea cuotas y consumo de tokens en tiempo real con mínimo consumo y reanuda tus conversaciones desde la terminal o desde tu entorno de escritorio.
+Gestores de perfiles locales para **Codex CLI** (`codex-switch`), **Antigravity CLI** (`agy-switch`), **OpenCode** (`opencode-switch`) y **Pi Coding Agent** (`pi-switch`), acompañados de un **Widget de Barra de Tareas / Bandeja del Sistema ultraligero** (`switch-tray`) y un **Desktop Dashboard flotante** (`switch-widget`). Guarda una autenticación con un alias, cambia de perfil en 1 clic, monitorea cuotas y consumo de tokens en tiempo real con mínimo consumo y reanuda tus conversaciones desde la terminal o desde tu entorno de escritorio.
 
 Proyecto independiente, sin afiliación con los proveedores de las herramientas.
 
@@ -212,6 +212,17 @@ opencode-switch usar trabajo     # activa una cuenta con 'opencode auth switch' 
 opencode-switch reautenticar trabajo  # reautentica una cuenta existente
 opencode-switch eliminar trabajo # cierra sesión/elimina una cuenta (alias: logout, rm)
 opencode-switch version
+
+# Para Pi Coding Agent (multi-cuenta por intercambio de ~/.pi/agent/auth.json):
+pi-switch status               # consumo de tokens y coste leído de las sesiones locales (alias: cuota, tokens)
+pi-switch listar               # listas las cuentas guardadas de Pi (alias: cuentas)
+pi-switch guardar personal     # guarda el auth.json activo (tus credenciales de pi) bajo un alias
+pi-switch login trabajo anthropic  # ejecuta 'pi auth login anthropic' y guarda el resultado como 'trabajo'
+pi-switch usar trabajo         # conmuta el perfil activo (--force si hay sesiones abiertas)
+pi-switch paralelo trabajo -- pi   # ejecución concurrente aislada con PI_CODING_AGENT_DIR temporal
+pi-switch reautenticar trabajo # reautentica y sincroniza el perfil guardado
+pi-switch eliminar trabajo     # borra el perfil guardado (no toca las credenciales en vivo)
+pi-switch version
 ```
 
 También se aceptan `save`, `rm`, `borrar`, `quitar`, `delete`, `mv`, `rename`, `new`, `list`, `use`, `resume`, `cuota`, `quota` y `usage`. Ejecutar el comando sin argumentos (`codex-switch` o `agy-switch`) consulta el estado en vivo de todas las cuentas. `id` muestra el identificador de la última conversación detectada; `continuar <id>` permite elegir una explícitamente.
@@ -223,7 +234,8 @@ Los alias admiten de 1 a 64 caracteres: letras ASCII, números, puntos, guiones 
 El comando `status` (o `tokens`, `cuota`, `usage`) consulta en tiempo real y en paralelo las APIs oficiales de OpenAI / Google para cada cuenta guardada:
 - **Codex CLI**: Muestra ventana de 5 horas (o semanal), porcentaje usado/restante con barras visuales, tiempo exacto hasta el próximo reseteo, créditos de reset disponibles y si la cuenta está lista o agotada.
 - **Antigravity CLI**: Muestra la cuota restante de modelos Gemini y de terceros (Claude / GPT), tiempo de refresco y plan/tier activo.
-- **OpenCode**: Muestra el consumo acumulado real de tokens (entrada/salida/razonamiento/caché) y el coste, desglosado por proveedor y modelo, leído de la base de datos local de OpenCode.
+- **OpenCode**: Muestra el consumo acumulado real de tokens (entrada/salida/razonamiento/caché) y el coste, desglosado por proveedor y modelo, leído de la base de datos local de OpenCode. **Además consulta en vivo la cuota Go Plus** (`GET https://opencode.ai/zen/go/v1/usage` con la API key `oc_sk_...`): ventanas de 5 horas (rolling), semanal y mensual con % usado, % restante y hora de reseteo. La clave se resuelve de la credencial activa de `opencode.db` o, si la cuenta está configurada en Pi, del `auth.json` de Pi (`opencode-go` / `opencode`). Si la cuenta no tiene plan Go Plus (HTTP 403), simplemente no se muestra el bloque de cuota (nunca se inventa).
+- **Pi Coding Agent**: Muestra el consumo real de tokens y coste agregado por proveedor y modelo, leído de los archivos de sesión JSONL (`~/.pi/agent/sessions/`). Pi no expone un endpoint HTTP de saldo/cuota, por lo que `saldo` y `rate_limit` se reportan como `null` (nunca se inventa cuota). La multi-cuenta se resuelve por intercambio atómico de `~/.pi/agent/auth.json` y el aislamiento concurrente usa `PI_CODING_AGENT_DIR`.
 - **Auto-refresco inteligente**: Si un token de acceso OAuth expiró pero posee un refresh token válido, se refresca y actualiza automáticamente en disco sin requerir re-login manual.
 - **Detección de cuentas listas**: Resalta qué perfiles tienen tokens disponibles para que sepas a cuál cambiar al instante.
 
@@ -283,7 +295,9 @@ switch seleccionar codex secundaria --json
    - `unknown_quota`: La API remota no devolvió información de saldo interpretable.
    - `unsupported_capability`: Capacidad o proveedor no implementado (p. ej. saldo/cuota externa o ejecución paralela).
    - `lock_failed`: Contienda de concurrencia al intentar adquirir el bloqueo atómico `switch.lock`.
-4. **Soporte de OpenCode**: `opencode` cuenta con su propio adaptador (`opencode-switch`). Como OpenCode no expone un endpoint de saldo/cuota, reporta el **consumo real de tokens y coste** leído de su base local (`opencode.db`) y devuelve `saldo`/`rate_limit` en `null` (nunca inventa cuota).
+4. **Soporte de OpenCode**: `opencode` cuenta con su propio adaptador (`opencode-switch`). Reporta el **consumo real de tokens y coste** leído de su base local (`opencode.db`) y la **cuota Go Plus en vivo** (ventanas 5h/semanal/mensual con resets) desde la API oficial de uso `zen/go/v1/usage`, usando la API key de `opencode.db` o la del `auth.json` de Pi. El `saldo` monetario no existe en la API, por lo que se devuelve `null` (nunca inventa cuota).
+5. **Soporte de Pi Coding Agent**: `pi` cuenta con su adaptador (`pi-switch`) con conmutación atómica de `auth.json`, telemetría local de sesiones y ejecución paralela aislada vía `PI_CODING_AGENT_DIR`.
+6. **Ocultado de proveedores sin configurar**: un proveedor sin ninguna cuenta configurada (`disponible: false`, p. ej. OpenCode recién instalado o Pi sin `auth.json`) **no se muestra** en `switch status`, `switch listar`, la bandeja (`switch-tray`) ni el dashboard (`switch-widget`, que además oculta su pestaña). El contrato JSON sigue incluyéndolo con `disponible: false` para que los consumidores lo filtren.
 
 
 ## Datos y comportamiento
@@ -291,6 +305,7 @@ switch seleccionar codex secundaria --json
 - Codex: usa `$CODEX_HOME` o `~/.codex`. Los perfiles se guardan en `cuentas/*.json`.
 - Antigravity: usa `~/.gemini/antigravity-cli`. Los perfiles se guardan en `cuentas/*.token`.
 - OpenCode: usa su base de datos local `~/.local/share/opencode/opencode.db` (configurable con `OPENCODE_DB`). Las cuentas se gestionan de forma nativa con `opencode auth`; el consumo de tokens/coste se lee de las tablas de sesiones.
+- Pi Coding Agent: usa su directorio de agente `~/.pi/agent` (configurable con `PI_CODING_AGENT_DIR`). Switch guarda snapshots de `auth.json` en `~/.pi/agent/cuentas/<alias>.json` y registra el perfil activo en `~/.pi/agent/.active_profile`; el consumo se lee de `~/.pi/agent/sessions/`.
 - **Compatibilidad con GNOME Keyring en Linux**: Antigravity CLI en entornos de escritorio Linux almacena por defecto sus credenciales en el Secret Service del sistema (GNOME Keyring / libsecret). `agy-switch` detecta y sincroniza automáticamente las credenciales entre el Keyring del sistema y el archivo de tokens local (`~/.gemini/antigravity-cli/antigravity-oauth-token`), permitiendo guardar, consultar y alternar perfiles sin discrepancias tanto en entornos gráficos de escritorio como en servidores headless.
 - **Agregar cuentas en entorno aislado sin interrumpir sesiones (`agregar`)**: Con `codex-switch agregar <alias>` y `agy-switch agregar <alias>` (alias: `add`), puedes autenticar y registrar cuentas adicionales para que aparezcan en tu panel de monitoreo (`switch-widget`, `switch-tray` y `status`) **sin tener que cerrar tus chats abiertos ni cambiar de cuenta activa**. La autenticación se ejecuta en un sandbox temporal aislado que no toca tu sesión activa ni archivos en uso. Además, soporta `--desde <archivo_o_json>` para importar credenciales directas sin abrir navegador.
 - **Protección contra perfiles duplicados y sobrescrituras**: Al ejecutar `guardar <alias>`, el sistema verifica automáticamente si la cuenta activa ya se encuentra guardada bajo otro perfil. Si ya existe, bloquea la duplicación innecesaria y sugiere renombrarlo con `renombrar` o forzarlo con `--force`. Asimismo, si el alias ya pertenece a otra cuenta diferente, previene la sobrescritura accidental a menos que se indique `--force`.
@@ -309,7 +324,7 @@ Estos scripts dependen de rutas y formatos internos de las CLI, que pueden cambi
 
 Puedes consultar la versión instalada de cada componente en cualquier momento con:
 ```bash
-switch version            # Muestra versiones de Switch, Codex, AGY y OpenCode
+switch version            # Muestra versiones de Switch, Codex, AGY, OpenCode y Pi
 codex-switch version      # o: codex-switch --version / -v
 agy-switch version        # o: agy-switch --version / -v
 opencode-switch version   # o: opencode-switch --version / -v
@@ -324,7 +339,7 @@ switch-tray --version
 switch actualizar
 ```
 *Actualiza de forma inteligente:*
-1. **CLI Account Switch** (`switch`, `codex-switch`, `agy-switch`, `opencode-switch`, `switch-widget`, `switch-tray`) a la última versión de GitHub.
+1. **CLI Account Switch** (`switch`, `codex-switch`, `agy-switch`, `opencode-switch`, `pi-switch`, `switch-widget`, `switch-tray`) a la última versión de GitHub.
 2. **OpenAI Codex CLI** mediante `codex update`.
 3. **Google Antigravity CLI** mediante `agy update`.
 
@@ -341,7 +356,7 @@ git pull --ff-only
 ./install.sh
 ```
 
-Para desinstalar, elimina `switch`, `codex-switch`, `agy-switch`, `opencode-switch`, `switch-widget` y `switch-tray` del directorio de instalación (`~/.local/bin`). Tus perfiles e historiales permanecen en sus directorios de configuración.
+Para desinstalar, elimina `switch`, `codex-switch`, `agy-switch`, `opencode-switch`, `pi-switch`, `switch-widget` y `switch-tray` del directorio de instalación (`~/.local/bin`). Tus perfiles e historiales permanecen en sus directorios de configuración.
 
 ## Integración de Nuevos Agentes y Proveedores (DeepSeek, OpenCode, etc.)
 

@@ -13,6 +13,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import pytest
 
@@ -133,6 +135,128 @@ def test_opencode_cuota_json_telemetry(isolated_env):
     # OpenCode no expone saldo/cuota externa: nunca se inventa.
     assert data["cuotas"][0]["saldo"] is None
     assert data["cuotas"][0]["rate_limit"] is None
+
+
+class _GoPlusMockHandler(BaseHTTPRequestHandler):
+    """Mock de https://opencode.ai/zen/go/v1/usage con la respuesta real observada."""
+
+    def do_GET(self):  # noqa: N802
+        assert self.path == "/zen/go/v1/usage"
+        assert self.headers.get("Authorization", "").startswith("Bearer oc_sk_")
+        body = json.dumps({
+            "usage": {
+                "rolling": {"status": "ok", "percent": 8, "resetsAt": "2030-01-01T00:00:00.000Z"},
+                "weekly": {"status": "ok", "percent": 3, "resetsAt": "2030-01-07T00:00:00.000Z"},
+                "monthly": {"status": "ok", "percent": 1, "resetsAt": "2030-02-01T00:00:00.000Z"},
+            }
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+def test_opencode_go_plus_usage_cuota(isolated_env, tmp_path):
+    """La cuota Go Plus (5h/weekly/monthly) debe consultarse a la API de uso y
+    reportarse en rate_limit.ventanas, tanto si la key vive en opencode.db como
+    si está configurada en el auth.json de Pi."""
+    server = HTTPServer(("127.0.0.1", 0), _GoPlusMockHandler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        env = isolated_env["env"].copy()
+        env["OPENCODE_USAGE_URL"] = f"http://127.0.0.1:{port}/zen/go/v1/usage"
+        env["HOME"] = str(tmp_path / "no-pi-home")
+
+        # 1. Key en la credencial de opencode.db (fixture usa sk-activa; la
+        #    reescribimos con una clave con prefijo oc_sk_ para el caso Go).
+        con = sqlite3.connect(str(isolated_env["db_path"]))
+        con.execute("UPDATE credential SET value = ? WHERE active = 1",
+                    (json.dumps({"type": "api", "key": "oc_sk_test_key_active"}),))
+        con.commit()
+        con.close()
+
+        res = subprocess.run(
+            [sys.executable, str(OPENCODE_CLI), "cuota", "--json"],
+            env=env, capture_output=True, text=True,
+        )
+        assert res.returncode == 0, res.stderr
+        data = json.loads(res.stdout)
+        q = next(c for c in data["cuotas"] if c["es_activa"])
+        ventanas = (q["rate_limit"] or {}).get("ventanas")
+        assert ventanas, "rate_limit.ventanas debe contener la cuota Go Plus"
+        assert ventanas["5h"]["used_percent"] == 8
+        assert ventanas["5h"]["remaining_percent"] == 92
+        assert ventanas["weekly"]["used_percent"] == 3
+        assert ventanas["monthly"]["used_percent"] == 1
+        assert ventanas["5h"]["reset_after_seconds"] > 0
+
+        # 2. Fallback: sin key en opencode.db pero configurada en Pi auth.json.
+        pi_dir = tmp_path / "pihome" / ".pi" / "agent"
+        pi_dir.mkdir(parents=True)
+        (pi_dir / "auth.json").write_text(json.dumps(
+            {"opencode-go": {"type": "api_key", "key": "oc_sk_pi_fallback"}}
+        ), encoding="utf-8")
+        env2 = env.copy()
+        env2["PI_CODING_AGENT_DIR"] = str(pi_dir)
+        con = sqlite3.connect(str(isolated_env["db_path"]))
+        con.execute("UPDATE credential SET value = ?", (json.dumps({"type": "oauth", "access": "x"}),))
+        con.commit()
+        con.close()
+        res2 = subprocess.run(
+            [sys.executable, str(OPENCODE_CLI), "cuota", "--json"],
+            env=env2, capture_output=True, text=True,
+        )
+        data2 = json.loads(res2.stdout)
+        q2 = next(c for c in data2["cuotas"] if c["es_activa"])
+        assert (q2["rate_limit"] or {}).get("ventanas", {}).get("weekly", {}).get("used_percent") == 3
+    finally:
+        server.shutdown()
+        con = sqlite3.connect(str(isolated_env["db_path"]))
+        con.execute("UPDATE credential SET value = ? WHERE id = 'cred_activa'",
+                    (json.dumps({"type": "api", "key": "sk-activa"}),))
+        con.execute("UPDATE credential SET value = ? WHERE id = 'cred_secundaria'",
+                    (json.dumps({"type": "api", "key": "sk-sec"}),))
+        con.commit()
+        con.close()
+
+
+def test_opencode_sin_cuentas_no_disponible(tmp_path: Path):
+    """Sin ninguna cuenta configurada en la BD, el proveedor no debe reportarse disponible."""
+    data_dir = tmp_path / "opencode"
+    data_dir.mkdir()
+    db_path = data_dir / "opencode.db"
+    con = sqlite3.connect(str(db_path))
+    con.execute("CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, connector_id TEXT, method_id TEXT, active INTEGER, time_created INTEGER, time_updated INTEGER)")
+    con.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, model TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, time_created INTEGER)")
+    con.commit()
+    con.close()
+
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path / "home")
+    env["OPENCODE_DB"] = str(db_path)
+    env["PATH"] = f"{BIN_DIR}:{env.get('PATH', '')}"
+
+    res = subprocess.run(
+        [sys.executable, str(OPENCODE_CLI), "cuentas", "--json"],
+        env=env, capture_output=True, text=True,
+    )
+    assert res.returncode == 0, res.stderr
+    data = json.loads(res.stdout)
+    assert data["disponible"] is False
+    assert data["cuentas"] == []
+
+    # En la suite unificada tampoco debe aparecer como disponible.
+    res = subprocess.run(
+        [sys.executable, str(SWITCH_CLI), "cuentas", "opencode", "--json"],
+        env=env, capture_output=True, text=True,
+    )
+    data = json.loads(res.stdout)
+    assert data["proveedores"]["opencode"]["disponible"] is False
 
 
 def test_opencode_preflight_json(isolated_env):

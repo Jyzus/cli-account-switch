@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.6"
+VERSION = "1.3.0"
 GITHUB_REPO = "Jyzus/cli-account-switch"
 INSTALL_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
 
@@ -90,6 +90,18 @@ def cmd_version():
         except Exception:
             opencode_ver = "Instalado"
 
+    pi_ver = "No instalado"
+    pi_path = shutil.which("pi")
+    if pi_path:
+        try:
+            r = subprocess.run(["pi", "--version"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                pi_ver = r.stdout.strip().splitlines()[0].strip()
+            else:
+                pi_ver = "Instalado"
+        except Exception:
+            pi_ver = "Instalado"
+
     print(f"\n╭─────────────────────────────────────────────────────────────╮")
     print(f"│  ✦ CLI Account Switch v{VERSION:<36}│")
     print(f"╰─────────────────────────────────────────────────────────────╯")
@@ -97,6 +109,7 @@ def cmd_version():
     print(f"  • OpenAI Codex : \033[1;36m{codex_ver}\033[0m")
     print(f"  • Google AGY   : \033[1;35m{agy_ver}\033[0m")
     print(f"  • OpenCode     : \033[1;33m{opencode_ver}\033[0m")
+    print(f"  • Pi           : \033[1;34m{pi_ver}\033[0m")
     print(f"  • Repositorio  : https://github.com/{GITHUB_REPO}\n")
     print(f"  🔄 Para actualizar Switch, Codex y AGY:")
     print(f"     \033[1;33mswitch actualizar\033[0m\n")
@@ -216,28 +229,46 @@ def cmd_actualizar(args: list[str]):
     print("   Usa \033[1;32mswitch version\033[0m para verificar el estado de todas las herramientas.\n")
 
 
+def provider_has_configured_accounts(tool_name: str) -> bool:
+    """True si el adaptador reporta al menos una cuenta configurada (disponible).
+
+    Los proveedores sin ninguna cuenta configurada no deben mostrarse.
+    """
+    data = run_tool_json(tool_name, ["cuentas", "--json"])
+    if not data:
+        return False
+    return bool(data.get("disponible")) and bool(data.get("cuentas"))
+
+
 def cmd_status(target: str = ""):
     codex_tool = find_tool("codex-switch")
     agy_tool = find_tool("agy-switch")
 
-    if codex_tool:
+    if codex_tool and provider_has_configured_accounts("codex-switch"):
         print("\n===============================================================")
         print("  OPENAI CODEX CLI · CUOTAS Y TOKENS")
         print("===============================================================")
         subprocess.run([sys.executable, str(codex_tool), "status"] + ([target] if target else []))
 
-    if agy_tool:
+    if agy_tool and provider_has_configured_accounts("agy-switch"):
         print("\n===============================================================")
         print("  GOOGLE ANTIGRAVITY (AGY) · CUOTAS Y TOKENS")
         print("===============================================================")
         subprocess.run([sys.executable, str(agy_tool), "status"] + ([target] if target else []))
 
     opencode_tool = find_tool("opencode-switch")
-    if opencode_tool:
+    if opencode_tool and provider_has_configured_accounts("opencode-switch"):
         print("\n===============================================================")
         print("  OPENCODE · CONSUMO DE TOKENS Y COSTE (LOCAL)")
         print("===============================================================")
         subprocess.run([sys.executable, str(opencode_tool), "status"] + ([target] if target else []))
+
+    pi_tool = find_tool("pi-switch")
+    if pi_tool and provider_has_configured_accounts("pi-switch"):
+        print("\n===============================================================")
+        print("  PI CODING AGENT · CONSUMO DE TOKENS Y COSTE (LOCAL)")
+        print("===============================================================")
+        subprocess.run([sys.executable, str(pi_tool), "status"] + ([target] if target else []))
 
 
 def cmd_listar():
@@ -245,17 +276,22 @@ def cmd_listar():
     agy_tool = find_tool("agy-switch")
     opencode_tool = find_tool("opencode-switch")
 
-    if codex_tool:
+    if codex_tool and provider_has_configured_accounts("codex-switch"):
         print("\n--- Perfiles de OpenAI Codex ---")
         subprocess.run([sys.executable, str(codex_tool), "listar"])
 
-    if agy_tool:
+    if agy_tool and provider_has_configured_accounts("agy-switch"):
         print("\n--- Perfiles de Google Antigravity ---")
         subprocess.run([sys.executable, str(agy_tool), "listar"])
 
-    if opencode_tool:
+    if opencode_tool and provider_has_configured_accounts("opencode-switch"):
         print("\n--- Cuentas de OpenCode ---")
         subprocess.run([sys.executable, str(opencode_tool), "listar"])
+
+    pi_tool = find_tool("pi-switch")
+    if pi_tool and provider_has_configured_accounts("pi-switch"):
+        print("\n--- Cuentas de Pi Coding Agent ---")
+        subprocess.run([sys.executable, str(pi_tool), "listar"])
 
 
 def run_tool_json(tool_name: str, args: list[str]) -> dict | None:
@@ -277,6 +313,7 @@ def cmd_cuentas_json(provider_filter: str = ""):
     include_codex = not filter_norm or filter_norm in ("codex", "openai")
     include_agy = not filter_norm or filter_norm in ("agy", "antigravity", "gemini")
     include_opencode = not filter_norm or filter_norm in ("opencode",)
+    include_pi = not filter_norm or filter_norm in ("pi",)
 
     proveedores = {}
     if include_codex:
@@ -300,6 +337,13 @@ def cmd_cuentas_json(provider_filter: str = ""):
             "cuentas": [],
             "error": "No disponible"
         }
+    if include_pi:
+        proveedores["pi"] = run_tool_json("pi-switch", ["cuentas", "--json"]) or {
+            "disponible": False,
+            "perfil_activo": "",
+            "cuentas": [],
+            "error": "No disponible"
+        }
 
     return {
         "version": VERSION,
@@ -313,10 +357,12 @@ def cmd_cuota_json(target: str = "", provider_filter: str = ""):
     include_codex = not filter_norm or filter_norm in ("codex", "openai")
     include_agy = not filter_norm or filter_norm in ("agy", "antigravity", "gemini")
     include_opencode = not filter_norm or filter_norm in ("opencode",)
+    include_pi = not filter_norm or filter_norm in ("pi",)
 
     codex_args = ["cuota", "--json"] + ([target] if target else [])
     agy_args = ["cuota", "--json"] + ([target] if target else [])
     opencode_args = ["cuota", "--json"] + ([target] if target else [])
+    pi_args = ["cuota", "--json"] + ([target] if target else [])
 
     proveedores = {}
     if include_codex:
@@ -340,6 +386,13 @@ def cmd_cuota_json(target: str = "", provider_filter: str = ""):
             "cuentas": [],
             "error": "No disponible"
         }
+    if include_pi:
+        proveedores["pi"] = run_tool_json("pi-switch", pi_args) or {
+            "disponible": False,
+            "perfil_activo": "",
+            "cuentas": [],
+            "error": "No disponible"
+        }
 
     return {
         "version": VERSION,
@@ -353,6 +406,7 @@ def cmd_ocupacion_json(provider_filter: str = ""):
     include_codex = not filter_norm or filter_norm in ("codex", "openai")
     include_agy = not filter_norm or filter_norm in ("agy", "antigravity", "gemini")
     include_opencode = not filter_norm or filter_norm in ("opencode",)
+    include_pi = not filter_norm or filter_norm in ("pi",)
 
     proveedores = {}
     if include_codex:
@@ -373,6 +427,12 @@ def cmd_ocupacion_json(provider_filter: str = ""):
             "puede_conmutar": False,
             "error": "opencode-switch no disponible"
         }
+    if include_pi:
+        proveedores["pi"] = run_tool_json("pi-switch", ["ocupacion", "--json"]) or {
+            "ocupado": False,
+            "puede_conmutar": False,
+            "error": "pi-switch no disponible"
+        }
 
     return {
         "version": VERSION,
@@ -385,10 +445,12 @@ def cmd_preflight_json() -> dict:
     codex_tool = find_tool("codex-switch")
     agy_tool = find_tool("agy-switch")
     opencode_tool = find_tool("opencode-switch")
+    pi_tool = find_tool("pi-switch")
 
     codex_avail = codex_tool is not None
     agy_avail = agy_tool is not None
     opencode_avail = opencode_tool is not None
+    pi_avail = pi_tool is not None
 
     return {
         "protocol_version": 1,
@@ -396,6 +458,7 @@ def cmd_preflight_json() -> dict:
         "capabilities": {
             "parallel_codex": codex_avail,
             "parallel_agy": agy_avail,
+            "parallel_pi": pi_avail,
             "identity_reservation": True,
             "active_session_detection": True,
             "refresh_persistence_errors": True
@@ -421,6 +484,15 @@ def cmd_preflight_json() -> dict:
                 "active_session_detection": True,
                 "identity_reservation": False,
                 "refresh_persistence_errors": False,
+                "local_token_telemetry": True,
+                "external_quota_api": True
+            },
+            "pi": {
+                "soportado": pi_avail,
+                "parallel": pi_avail,
+                "active_session_detection": True,
+                "identity_reservation": True,
+                "refresh_persistence_errors": True,
                 "local_token_telemetry": True
             }
         }
@@ -439,6 +511,19 @@ def cmd_seleccionar_json(prov: str, cuenta: str, dry_run: bool = False):
             "permitido": False,
             "codigo": "invalid_auth",
             "mensaje": "Error al comunicar con opencode-switch",
+            "bloqueo_adquirido": False,
+            "cambio_realizado": False
+        }
+    if prov in ("pi",):
+        args = ["seleccionar", cuenta, "--json"] + (["--dry-run"] if dry_run else [])
+        res = run_tool_json("pi-switch", args)
+        if res:
+            return res
+        return {
+            "solicitud": {"proveedor": "pi", "cuenta_destino": cuenta, "dry_run": dry_run},
+            "permitido": False,
+            "codigo": "invalid_auth",
+            "mensaje": "Error al comunicar con pi-switch",
             "bloqueo_adquirido": False,
             "cambio_realizado": False
         }
@@ -491,7 +576,7 @@ def main():
                 prov_filter = positionals[0]
                 target = positionals[1]
             elif len(positionals) == 1:
-                if positionals[0].lower() in ("codex", "agy", "opencode", "openai", "gemini", "antigravity"):
+                if positionals[0].lower() in ("codex", "agy", "opencode", "pi", "openai", "gemini", "antigravity"):
                     prov_filter = positionals[0]
                 else:
                     target = positionals[0]
@@ -573,11 +658,13 @@ def main():
             exec_subcommand("agy-switch", ["paralelo", cuenta] + (["--"] + extra_cmd if extra_cmd else []))
         elif prov in ("codex", "openai"):
             exec_subcommand("codex-switch", ["paralelo", cuenta] + (["--"] + extra_cmd if extra_cmd else []))
+        elif prov in ("pi",):
+            exec_subcommand("pi-switch", ["paralelo", cuenta] + (["--"] + extra_cmd if extra_cmd else []))
         elif prov in ("opencode",):
             print("❌ Error: OpenCode no cuenta con adaptador de ejecución paralela en Switch.", file=sys.stderr)
             sys.exit(1)
         else:
-            print(f"❌ Error: Proveedor desconocido '{prov}'. Usa 'agy', 'codex' u 'opencode'.", file=sys.stderr)
+            print(f"❌ Error: Proveedor desconocido '{prov}'. Usa 'agy', 'codex', 'pi' u 'opencode'.", file=sys.stderr)
             sys.exit(1)
     elif args[0] in ("tray", "barra", "taskbar"):
         exec_subcommand("switch-tray", args[1:])
@@ -593,6 +680,8 @@ def main():
         exec_subcommand("agy-switch", args[1:])
     elif args[0] in ("opencode",):
         exec_subcommand("opencode-switch", args[1:])
+    elif args[0] in ("pi",):
+        exec_subcommand("pi-switch", args[1:])
     elif args[0] in ("listar", "list", "ls"):
         cmd_listar()
     elif args[0] in ("agregar", "add"):
@@ -603,23 +692,29 @@ def main():
             exec_subcommand("agy-switch", ["agregar"] + args[2:])
         elif len(args) > 1 and args[1] in ("opencode",):
             exec_subcommand("opencode-switch", ["login"] + args[2:])
+        elif len(args) > 1 and args[1] == "pi":
+            exec_subcommand("pi-switch", ["login"] + args[2:])
         else:
             print("Uso para agregar cuenta:")
             print("  switch codex agregar <nombre> [--device-auth] [--desde <archivo>]")
             print("  switch agy agregar <nombre> [--desde <archivo>]")
             print("  switch opencode login <alias>")
+            print("  switch pi login <alias> [proveedor]")
             print("\nO usa directamente:")
             print("  codex-switch agregar <nombre>")
             print("  agy-switch agregar <nombre>")
             print("  opencode-switch login <alias>")
+            print("  pi-switch login <alias> [proveedor]")
             sys.exit(1)
     elif args[0] in ("guardar", "save"):
         if len(args) > 1 and args[1] in ("codex", "openai"):
             exec_subcommand("codex-switch", ["guardar"] + args[2:])
         elif len(args) > 1 and args[1] in ("agy", "antigravity"):
             exec_subcommand("agy-switch", ["guardar"] + args[2:])
+        elif len(args) > 1 and args[1] == "pi":
+            exec_subcommand("pi-switch", ["guardar"] + args[2:])
         else:
-            print("Uso: switch codex guardar <nombre>  o  switch agy guardar <nombre>")
+            print("Uso: switch codex guardar <nombre>  o  switch agy guardar <nombre>  o  switch pi guardar <nombre>")
             print("     (OpenCode gestiona sus cuentas de forma nativa: switch opencode login <alias>)")
             sys.exit(1)
     elif args[0] in ("reautenticar", "reauth", "login"):
@@ -628,7 +723,7 @@ def main():
         prov = ""
         nombre = ""
         if positionals:
-            if positionals[0] in ("codex", "openai", "agy", "antigravity", "gemini", "opencode"):
+            if positionals[0] in ("codex", "openai", "agy", "antigravity", "gemini", "opencode", "pi"):
                 prov = positionals[0]
                 if len(positionals) > 1:
                     nombre = positionals[1]
@@ -637,6 +732,7 @@ def main():
 
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
         agy_home = Path.home() / ".gemini" / "antigravity-cli"
+        pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
 
         if prov in ("codex", "openai"):
             exec_subcommand("codex-switch", ["reautenticar", nombre] + options if nombre else ["reautenticar"] + options)
@@ -644,22 +740,28 @@ def main():
             exec_subcommand("agy-switch", ["reautenticar", nombre] + options if nombre else ["reautenticar"] + options)
         elif prov in ("opencode",):
             exec_subcommand("opencode-switch", ["reautenticar", nombre] + options if nombre else ["login"] + options)
+        elif prov == "pi":
+            exec_subcommand("pi-switch", ["reautenticar", nombre] + options if nombre else ["reautenticar"] + options)
         elif nombre:
             in_codex = (codex_home / "cuentas" / f"{nombre}.json").is_file()
             in_agy = (agy_home / "cuentas" / f"{nombre}.token").is_file()
-            if in_codex and not in_agy:
+            in_pi = (pi_dir / "cuentas" / f"{nombre}.json").is_file()
+            if in_codex and not in_agy and not in_pi:
                 exec_subcommand("codex-switch", ["reautenticar", nombre] + options)
-            elif in_agy and not in_codex:
+            elif in_agy and not in_codex and not in_pi:
                 exec_subcommand("agy-switch", ["reautenticar", nombre] + options)
-            elif in_codex and in_agy:
-                print(f"El perfil '{nombre}' existe tanto en Codex como en AGY.")
-                print(f"Especifica la herramienta con: switch codex reautenticar {nombre}  o  switch agy reautenticar {nombre}")
+            elif in_pi and not in_codex and not in_agy:
+                exec_subcommand("pi-switch", ["reautenticar", nombre] + options)
+            elif in_codex or in_agy or in_pi:
+                found = [n for n, ok in (("Codex", in_codex), ("AGY", in_agy), ("Pi", in_pi)) if ok]
+                print(f"El perfil '{nombre}' existe en: {', '.join(found)}.")
+                print(f"Especifica la herramienta con: switch <herramienta> reautenticar {nombre}")
                 sys.exit(1)
             else:
-                print(f"❌ Error: El perfil '{nombre}' no existe en cuentas de Codex ni de AGY.")
+                print(f"❌ Error: El perfil '{nombre}' no existe en cuentas de Codex, AGY ni Pi.")
                 sys.exit(1)
         else:
-            print("Uso: switch reautenticar [codex|agy] <nombre>")
+            print("Uso: switch reautenticar [codex|agy|pi] <nombre>")
             sys.exit(1)
     elif args[0] in ("usar", "use"):
         # Buscar en cuál herramienta existe el perfil
@@ -670,20 +772,21 @@ def main():
             sys.exit(1)
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
         agy_home = Path.home() / ".gemini" / "antigravity-cli"
+        pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
 
         in_codex = (codex_home / "cuentas" / f"{alias}.json").is_file()
         in_agy = (agy_home / "cuentas" / f"{alias}.token").is_file()
+        in_pi = (pi_dir / "cuentas" / f"{alias}.json").is_file()
 
-        if in_codex and not in_agy:
-            exec_subcommand("codex-switch", ["usar"] + args[1:])
-        elif in_agy and not in_codex:
-            exec_subcommand("agy-switch", ["usar"] + args[1:])
-        elif in_codex and in_agy:
-            print(f"El perfil '{alias}' existe tanto en Codex como en AGY.")
-            print(f"Especifica la herramienta con: switch codex usar {alias}  o  switch agy usar {alias}")
+        hits = [n for n, ok in (("codex", in_codex), ("agy", in_agy), ("pi", in_pi)) if ok]
+        if len(hits) == 1:
+            exec_subcommand(f"{hits[0]}-switch", ["usar"] + args[1:])
+        elif len(hits) > 1:
+            print(f"El perfil '{alias}' existe en: {', '.join(hits)}.")
+            print(f"Especifica la herramienta con: switch <herramienta> usar {alias}")
             sys.exit(1)
         else:
-            # No existe en Codex ni AGY: probar con OpenCode (gestión nativa de cuentas).
+            # No existe en Codex, AGY ni Pi: probar con OpenCode (gestión nativa de cuentas).
             exec_subcommand("opencode-switch", ["usar"] + args[1:])
     elif args[0] in ("eliminar", "borrar", "rm"):
         if len(args) > 1 and args[1] in ("codex", "openai"):
@@ -692,8 +795,10 @@ def main():
             exec_subcommand("agy-switch", ["eliminar"] + args[2:])
         elif len(args) > 1 and args[1] in ("opencode",):
             exec_subcommand("opencode-switch", ["eliminar"] + args[2:])
+        elif len(args) > 1 and args[1] == "pi":
+            exec_subcommand("pi-switch", ["eliminar"] + args[2:])
         else:
-            print("Uso: switch codex eliminar <nombre>  ·  switch agy eliminar <nombre>  ·  switch opencode eliminar <nombre>")
+            print("Uso: switch codex eliminar <nombre>  ·  switch agy eliminar <nombre>  ·  switch opencode eliminar <nombre>  ·  switch pi eliminar <nombre>")
             sys.exit(1)
     elif args[0] in ("renombrar", "mv"):
         if len(args) > 1 and args[1] in ("codex", "openai"):
@@ -722,6 +827,7 @@ def main():
         print("  switch codex [subcomando]   Ejecuta comandos de codex-switch (status, usar, agregar, etc.)")
         print("  switch agy [subcomando]     Ejecuta comandos de agy-switch (status, usar, agregar, etc.)")
         print("  switch opencode [subcomando] Ejecuta comandos de opencode-switch (status, usar, login, etc.)")
+        print("  switch pi [subcomando]      Ejecuta comandos de pi-switch (status, usar, guardar, login, paralelo, etc.)")
         print("\nEjemplos:")
         print("  switch tray --autostart enable")
         print("  switch actualizar")

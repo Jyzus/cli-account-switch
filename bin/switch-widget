@@ -23,7 +23,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.2.6"
+VERSION = "1.3.0"
 
 # ==============================================================================
 # CARGA DE MÓDULOS DE CODEX Y AGY
@@ -58,6 +58,7 @@ def load_cli_module(name: str):
 CODEX_MOD = load_cli_module("codex-switch")
 AGY_MOD = load_cli_module("agy-switch")
 OPENCODE_MOD = load_cli_module("opencode-switch")
+PI_MOD = load_cli_module("pi-switch")
 
 # ==============================================================================
 # PROVEEDORES DE CUENTAS (EXTENSIBLES)
@@ -402,6 +403,125 @@ class AgyProvider(BaseProvider):
         return False, res.stderr.strip() or res.stdout.strip() or "Error al eliminar perfil"
 
 
+class PiProvider(BaseProvider):
+    id = "pi"
+    name = "Pi Coding Agent"
+    badge = "PI"
+    cli_cmd = "pi-switch"
+    color = "#3b82f6"
+
+    def is_available(self) -> bool:
+        return PI_MOD is not None
+
+    def get_running_clients(self) -> list:
+        if PI_MOD and hasattr(PI_MOD, "find_running_clients"):
+            try:
+                return PI_MOD.find_running_clients("pi")
+            except Exception:
+                pass
+        return []
+
+    def get_status(self) -> dict:
+        if not PI_MOD:
+            return {
+                "id": self.id,
+                "name": self.name,
+                "badge": self.badge,
+                "color": self.color,
+                "error": "Módulo pi-switch no encontrado",
+                "accounts": [],
+            }
+
+        try:
+            cuentas_data = PI_MOD.cmd_cuentas_json()
+            usage = PI_MOD.read_usage_totals()
+        except Exception as e:
+            return {
+                "id": self.id,
+                "name": self.name,
+                "badge": self.badge,
+                "color": self.color,
+                "error": str(e),
+                "accounts": [],
+            }
+
+        total_cost = 0.0
+        total_tokens = 0
+        sum_input = sum_output = sum_reason = sum_cr = sum_cw = 0
+        n_sessions = 0
+        for t in (usage or {}).values():
+            total_cost += float(t.get("cost", 0) or 0)
+            sum_input += int(t.get("input", 0) or 0)
+            sum_output += int(t.get("output", 0) or 0)
+            sum_reason += int(t.get("reasoning", 0) or 0)
+            sum_cr += int(t.get("cache_read", 0) or 0)
+            sum_cw += int(t.get("cache_write", 0) or 0)
+            n_sessions += int(t.get("sessions", 0) or 0)
+        total_tokens = sum_input + sum_output + sum_reason
+
+        accounts = []
+        for c in cuentas_data.get("cuentas", []) or []:
+            accounts.append({
+                "name": c.get("alias"),
+                "provider": self.id,
+                "provider_name": self.name,
+                "email": c.get("identificador_enmascarado") or "",
+                "plan": c.get("plan") or "PI",
+                "is_active": bool(c.get("es_activa")),
+                "error": None,
+                "status": "available" if c.get("estado") == "disponible" else "sin_guardar",
+                "status_text": "Disponible" if c.get("estado") == "disponible" else "Sesión sin guardar",
+                "tokens": {
+                    "cost": total_cost,
+                    "input": sum_input,
+                    "output": sum_output,
+                    "reasoning": sum_reason,
+                    "cache_read": sum_cr,
+                    "cache_write": sum_cw,
+                    "sessions": n_sessions,
+                    "total": total_tokens,
+                },
+            })
+
+        return {
+            "id": self.id,
+            "name": self.name,
+            "badge": self.badge,
+            "cli_cmd": self.cli_cmd,
+            "color": self.color,
+            "active_profile": cuentas_data.get("perfil_activo", ""),
+            "active_email": "",
+            "accounts": accounts,
+        }
+
+    def switch_account(self, name: str, force: bool = False) -> tuple[bool, str, list]:
+        mod_file = find_module_file("pi-switch")
+        if not mod_file:
+            return False, "Ejecutable pi-switch no encontrado", []
+        cmd = [sys.executable, str(mod_file), "usar", name]
+        if force:
+            cmd.append("--force")
+
+        running = self.get_running_clients()
+        if running and not force:
+            return False, f"Se detectaron {len(running)} sesiones activas de Pi", running
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Cuenta cambiada con éxito a '{name}'", []
+        return False, res.stderr.strip() or res.stdout.strip() or "Error al cambiar cuenta", running
+
+    def delete_account(self, name: str) -> tuple[bool, str]:
+        mod_file = find_module_file("pi-switch")
+        if not mod_file:
+            return False, "Ejecutable pi-switch no encontrado"
+        cmd = [sys.executable, str(mod_file), "eliminar", name]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Cuenta '{name}' eliminada con éxito"
+        return False, res.stderr.strip() or res.stdout.strip() or "Error al eliminar cuenta"
+
+
 class OpencodeProvider(BaseProvider):
     id = "opencode"
     name = "OpenCode"
@@ -459,6 +579,16 @@ class OpencodeProvider(BaseProvider):
                 "total": total,
             }
 
+        # Cuota Go Plus en vivo (API oficial) por credencial activa.
+        def ventanas_for(c: dict):
+            if hasattr(OPENCODE_MOD, "resolve_go_plus_usage"):
+                try:
+                    u = OPENCODE_MOD.resolve_go_plus_usage(c) or {}
+                    return u.get("ventanas")
+                except Exception:
+                    return None
+            return None
+
         accounts = []
         for c in creds:
             label = c.get("label") or "(sin etiqueta)"
@@ -474,6 +604,7 @@ class OpencodeProvider(BaseProvider):
                 "status": "available",
                 "status_text": "Disponible",
                 "tokens": t,
+                "ventanas": ventanas_for(c),
             })
 
         return {
@@ -520,6 +651,7 @@ PROVIDERS: dict[str, BaseProvider] = {
     "codex": CodexProvider(),
     "agy": AgyProvider(),
     "opencode": OpencodeProvider(),
+    "pi": PiProvider(),
 }
 
 # ==============================================================================
@@ -549,6 +681,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       --codex: #10b981;
       --agy: #8b5cf6;
       --opencode: #f59e0b;
+      --pi: #3b82f6;
       --green: #10b981;
       --amber: #f59e0b;
       --red: #ef4444;
@@ -948,6 +1081,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       background: rgba(245, 158, 11, 0.18);
       color: #fbbf24;
       border: 1px solid rgba(245, 158, 11, 0.35);
+    }
+
+    .provider-pi {
+      background: rgba(59, 130, 246, 0.18);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.35);
     }
 
     .active-badge {
@@ -1526,6 +1665,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <button class="tab-btn" data-filter="opencode">
           OpenCode <span class="tab-count" id="count-opencode">0</span>
         </button>
+        <button class="tab-btn" data-filter="pi" id="tab-pi">
+          Pi <span class="tab-count" id="count-pi">0</span>
+        </button>
       </div>
 
       <div class="search-box">
@@ -1731,6 +1873,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       let codexCount = 0;
       let agyCount = 0;
       let opencodeCount = 0;
+      let piCount = 0;
 
       (appData.providers || []).forEach(p => {
         (p.accounts || []).forEach(acc => {
@@ -1738,6 +1881,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           if (acc.provider === "codex") codexCount++;
           if (acc.provider === "agy") agyCount++;
           if (acc.provider === "opencode") opencodeCount++;
+          if (acc.provider === "pi") piCount++;
           if (acc.is_active) active++;
           if (acc.status === "available") ready++;
         });
@@ -1750,6 +1894,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       document.getElementById("count-codex").textContent = codexCount;
       document.getElementById("count-agy").textContent = agyCount;
       document.getElementById("count-opencode").textContent = opencodeCount;
+      document.getElementById("count-pi").textContent = piCount;
+
+      // Ocultar pestañas de proveedores sin ninguna cuenta configurada.
+      document.querySelectorAll(".tab-btn").forEach(btn => {
+        const f = btn.dataset.filter;
+        if (f === "all") return;
+        const countEl = document.getElementById("count-" + f);
+        if (countEl) {
+          btn.style.display = (parseInt(countEl.textContent, 10) || 0) === 0 ? "none" : "";
+        }
+      });
     }
 
     // Renderizar tarjetas de cuentas
@@ -1794,7 +1949,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       accountsContainer.innerHTML = filtered.map(acc => {
         const isCodex = acc.provider === "codex";
         const isOpencode = acc.provider === "opencode";
-        const providerClass = isCodex ? "provider-codex" : (isOpencode ? "provider-opencode" : "provider-agy");
+        const isPi = acc.provider === "pi";
+        const providerClass = isCodex ? "provider-codex" : (isOpencode ? "provider-opencode" : (isPi ? "provider-pi" : "provider-agy"));
         const statusClass = acc.status || "available";
 
         // Barras y cuotas
@@ -1869,10 +2025,38 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               </div>
             `;
           }
-        } else if (isOpencode) {
-          // OpenCode: consumo de tokens y coste local (sin cuota/saldo externo)
+        } else if (isOpencode || isPi) {
+          // OpenCode: cuota Go Plus en vivo (si existe) + consumo local de tokens.
           const t = acc.tokens || {};
-          quotasHtml = `
+          const vent = acc.ventanas || null;
+          let ventHtml = "";
+          if (vent) {
+            const ventDefs = [["5h", "⏱ 5-hour window"], ["weekly", "📅 Weekly"], ["monthly", "🗓 Monthly"]];
+            ventHtml += `<div class="quota-item"><div class="quota-header"><span class="quota-title" style="color:#93c5fd;">✦ Go Plus usage</span></div></div>`;
+            for (const [k, lbl] of ventDefs) {
+              const w = vent[k];
+              if (!w || w.remaining_percent === null || w.remaining_percent === undefined) continue;
+              const rem = w.remaining_percent;
+              const barClass = rem > 40 ? "bar-high" : (rem > 15 ? "bar-medium" : "bar-low");
+              const color = rem > 40 ? '#34d399' : (rem > 15 ? '#fbbf24' : '#f87171');
+              const resetTs = w.reset_at ? Math.floor(new Date(w.reset_at).getTime() / 1000) : 0;
+              ventHtml += `
+              <div class="quota-item">
+                <div class="quota-header">
+                  <span class="quota-title">${lbl}</span>
+                  <span class="quota-fraction" style="color: ${color};">${rem}% disponible</span>
+                </div>
+                <div class="progress-bar-bg">
+                  <div class="progress-bar-fill ${barClass}" style="width: ${rem}%"></div>
+                </div>
+                <div class="quota-footer">
+                  <span>${w.used_percent}% usado</span>
+                  ${resetTs ? `<span class="reset-clock" data-reset-ts="${resetTs}">⏳ Resetea en: <b>calculando...</b></span>` : ""}
+                </div>
+              </div>`;
+            }
+          }
+          quotasHtml = ventHtml + `
             <div class="quota-item">
               <div class="quota-header">
                 <span class="quota-title">⚡ Consumo acumulado</span>
@@ -2307,7 +2491,7 @@ def main():
     parser.add_argument("-v", "--version", action="version", version=f"CLI Account Switch Desktop Widget v{VERSION}")
     parser.add_argument("-p", "--port", type=int, default=4920, help="Puerto local del servidor (por defecto 4920)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host al que vincular el servidor (por defecto 127.0.0.1)")
-    parser.add_argument("-f", "--filter", type=str, choices=["all", "codex", "agy", "opencode"], default="all", help="Filtro predeterminado")
+    parser.add_argument("-f", "--filter", type=str, choices=["all", "codex", "agy", "opencode", "pi"], default="all", help="Filtro predeterminado")
     parser.add_argument("--no-browser", action="store_true", help="No abrir la interfaz gráfica automáticamente")
     parser.add_argument("--browser-tab", action="store_true", help="Abrir como pestaña del navegador en vez de ventana de app dedicada")
 

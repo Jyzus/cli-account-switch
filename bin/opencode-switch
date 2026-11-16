@@ -27,11 +27,13 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.2.6"
+VERSION = "1.3.0"
 GITHUB_REPO = "Jyzus/cli-account-switch"
 INSTALL_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/install.sh"
 
@@ -94,6 +96,176 @@ def get_config_dir() -> Path:
     if xdg:
         return Path(xdg).expanduser() / "opencode"
     return Path.home() / ".config" / "opencode"
+
+
+def get_pi_agent_dir() -> Path:
+    """Directorio de agente de Pi (fuente alternativa de la API key de OpenCode Go)."""
+    env_override = os.environ.get("PI_CODING_AGENT_DIR")
+    if env_override:
+        return Path(env_override).expanduser()
+    return Path.home() / ".pi" / "agent"
+
+
+def get_pi_opencode_keys() -> list[str]:
+    """
+    API keys de OpenCode (Zen/Go) configuradas en el auth.json de Pi.
+    Pi guarda el proveedor como 'opencode' / 'opencode-go' con {type, key}.
+    """
+    auth = get_pi_agent_dir() / "auth.json"
+    if not auth.is_file():
+        return []
+    try:
+        data = json.loads(auth.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    keys = []
+    for prov in ("opencode-go", "opencode", "opencode-zen"):
+        cred = data.get(prov)
+        if isinstance(cred, dict):
+            k = str(cred.get("key") or "")
+            if k.startswith("!"):
+                # Comando de secret manager: resolverlo aquí sería inseguro/lento; se omite.
+                continue
+            if k:
+                keys.append(k)
+    return keys
+
+
+# ==============================================================================
+# 2b. CUOTA GO PLUS · API OFICIAL DE USO (zen/go/v1/usage)
+# ==============================================================================
+
+USAGE_URL_DEFAULT = "https://opencode.ai/zen/go/v1/usage"
+_USAGE_CACHE: dict = {}
+USAGE_CACHE_TTL = 120  # segundos
+
+
+def cred_api_key(cred: dict | None) -> str:
+    """Extrae la API key (oc_sk_...) de una credencial de opencode.db.
+
+    Acepta tanto el dict con campo 'value' ya cargado como solo 'id' (se lee
+    bajo demanda desde la BD en solo-lectura).
+    """
+    if not cred:
+        return ""
+    raw = cred.get("value")
+    if raw is None:
+        con = _open_db()
+        if con is None:
+            return ""
+        try:
+            row = con.execute(
+                "SELECT value FROM credential WHERE id = ?", (cred.get("id") or "",)
+            ).fetchone()
+            raw = row["value"] if row else None
+        except Exception:
+            return ""
+        finally:
+            con.close()
+    try:
+        value = json.loads(raw or "{}")
+        if isinstance(value, dict):
+            return str(value.get("key") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def fetch_go_plus_usage(api_key: str) -> dict | None:
+    """
+    Consulta el uso real de OpenCode Go Plus:
+      GET https://opencode.ai/zen/go/v1/usage  (Authorization: Bearer <key>)
+    Respuesta: {"usage": {"rolling": {percent, resetsAt, status},
+                          "weekly": {...}, "monthly": {...}}}
+
+    Devuelve la estructura `rate_limit` normalizada de Switch o None si no hay
+    datos (sin clave válida, 403, error de red). Nunca inventa cuota.
+    """
+    if not api_key or not api_key.startswith("oc_"):
+        # Claves de test u otros proveedores: no aplican al endpoint Go.
+        return None
+
+    url = os.environ.get("OPENCODE_USAGE_URL", USAGE_URL_DEFAULT)
+    cache_key = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    now = time.time()
+    hit = _USAGE_CACHE.get(cache_key)
+    if hit and (now - hit[0]) < USAGE_CACHE_TTL:
+        return hit[1]
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "User-Agent": "switch-opencode/1.3",
+        },
+    )
+    result = None
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            usage = (payload or {}).get("usage") or {}
+            windows = {}
+            now_dt = datetime.now(timezone.utc)
+            mapping = (
+                ("rolling", "5h", "Ventana 5h"),
+                ("weekly", "weekly", "Semanal"),
+                ("monthly", "monthly", "Mensual"),
+            )
+            for src, dst, label in mapping:
+                w = usage.get(src)
+                if not isinstance(w, dict):
+                    continue
+                used_pct = w.get("percent")
+                reset_at = w.get("resetsAt") or ""
+                reset_sec = 0
+                reset_iso = reset_at
+                if reset_at:
+                    try:
+                        dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+                        reset_sec = max(0, int((dt - now_dt).total_seconds()))
+                    except Exception:
+                        pass
+                windows[dst] = {
+                    "label": label,
+                    "used_percent": int(used_pct) if used_pct is not None else None,
+                    "remaining_percent": max(0, 100 - int(used_pct)) if used_pct is not None else None,
+                    "status": w.get("status") or "ok",
+                    "reset_at": reset_iso,
+                    "reset_after_seconds": reset_sec,
+                }
+            if windows:
+                result = {"fuente": "zen/go/v1/usage", "ventanas": windows}
+    except urllib.error.HTTPError as e:
+        # 403 = cuenta sin plan Go Plus/Console budgets; no es un error del usuario.
+        result = None if e.code in (401, 403, 404) else None
+        if e.code in (401, 403):
+            result = {"fuente": "zen/go/v1/usage", "ventanas": None, "error": "sin_permisos"}
+        elif e.code == 429:
+            result = {"fuente": "zen/go/v1/usage", "ventanas": None, "error": "rate_limited"}
+        else:
+            result = {"fuente": "zen/go/v1/usage", "ventanas": None, "error": f"http_{e.code}"}
+    except Exception as e:
+        result = {"fuente": "zen/go/v1/usage", "ventanas": None, "error": "red"}
+
+    _USAGE_CACHE[cache_key] = (now, result)
+    return result
+
+
+def resolve_go_plus_usage(active_cred: dict | None) -> dict | None:
+    """
+    Obtiene la cuota Go Plus aunque la cuenta esté configurada en OpenCode o en Pi:
+      1. API key de la credencial activa de opencode.db.
+      2. Fallback: claves opencode/opencode-go del auth.json de Pi.
+    """
+    usage = fetch_go_plus_usage(cred_api_key(active_cred))
+    if usage and usage.get("ventanas"):
+        return usage
+    for key in get_pi_opencode_keys():
+        usage = fetch_go_plus_usage(key)
+        if usage and usage.get("ventanas"):
+            return usage
+    return usage
 
 
 def get_cuentas_dir() -> Path:
@@ -302,30 +474,40 @@ def db_freshness_iso() -> str:
 
 def fetch_provider_quota(cred: dict | None, active_profile: str = "") -> dict:
     """
-    Devuelve la telemetría real de consumo de OpenCode.
+    Telemetría real de consumo de OpenCode.
 
-    OpenCode no expone saldo ni límites de cuota vía API, por lo que 'saldo' y
-    'rate_limit' se reportan como None (unsupported_capability). El campo 'tokens'
-    lleva el consumo agregado real leído de la base de datos local.
+    - `rate_limit`: cuota Go Plus oficial consultada en la API de uso
+      (`https://opencode.ai/zen/go/v1/usage`) con la API key de la credencial
+      activa o, en su defecto, la configurada en Pi (`auth.json`). Ventanas
+      rolling(5h)/weekly/monthly con percent usado, restante y reset.
+    - `saldo`: OpenCode no expone saldo monetario → None (nunca se inventa).
+    - `tokens`: consumo agregado real leído de la base de datos local.
     """
     if cred is None:
+        go_usage = resolve_go_plus_usage(None)
         return {
             "email": "",
             "plan_type": "OPENCODE",
-            "rate_limit": None,
+            "rate_limit": (go_usage or {}).get("ventanas") and go_usage,
             "saldo": None,
             "tokens": None,
             "err_msg": "Sin credenciales de OpenCode",
         }
 
     usage = read_usage_totals()
+    go_usage = resolve_go_plus_usage(cred)
+    windows = (go_usage or {}).get("ventanas")
+    err = None
+    if go_usage and go_usage.get("error") == "sin_permisos":
+        # La cuenta existe pero no tiene plan Go Plus / Console budgets.
+        windows = None
     return {
         "email": cred.get("label", ""),
         "plan_type": (cred.get("integration_id") or "OPENCODE").upper(),
-        "rate_limit": None,
+        "rate_limit": go_usage if windows else None,
         "saldo": None,
         "tokens": usage,
-        "err_msg": None,
+        "err_msg": err,
     }
 
 
@@ -465,7 +647,7 @@ def cmd_cuentas_json() -> dict:
         })
 
     return {
-        "disponible": True,
+        "disponible": len(accounts) > 0,
         "perfil_activo": active["label"] if active else "",
         "cuentas": accounts,
     }
@@ -515,6 +697,7 @@ def cmd_cuota_json(target: str = "") -> dict:
 
     return {
         "proveedor": PROVIDER_ID,
+        "disponible": len(cuotas) > 0,
         "frescura": now_iso,
         "perfil_activo": active["label"] if active else "",
         "cuotas": cuotas,
@@ -660,6 +843,41 @@ def cmd_listar():
     print()
 
 
+def _fmt_reset(sec: int) -> str:
+    if sec <= 0:
+        return "reseteado"
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m, _ = divmod(sec, 60)
+    if d > 0:
+        return f"en {d}d {h}h"
+    if h > 0:
+        return f"en {h}h {m}m"
+    return f"en {m}m"
+
+
+def _print_go_plus_windows(active_cred: dict | None) -> bool:
+    """Imprime el panel Go Plus (5h/semanal/mensual). True si hay datos reales."""
+    go_usage = resolve_go_plus_usage(active_cred)
+    windows = (go_usage or {}).get("ventanas")
+    if not windows:
+        return False
+    print("\n  \033[1mGo Plus usage[0m [2m(opencode.ai/zen/go/v1/usage)[0m")
+    for key, label in (("5h", "5-hour window"), ("weekly", "Weekly"), ("monthly", "Monthly")):
+        w = windows.get(key)
+        if not w:
+            continue
+        used = w.get("used_percent")
+        remaining = w.get("remaining_percent")
+        bar_len = 24
+        filled = int(round((used or 0) / 100 * bar_len))
+        bar = "\033[1;34m" + "█" * filled + "\033[0;2m" + "░" * (bar_len - filled) + "\033[0m"
+        reset = _fmt_reset(int(w.get("reset_after_seconds") or 0))
+        warn = " \033[1;31m⚠\033[0m" if (remaining is not None and remaining <= 10) else ""
+        print(f"    {label:<16} {bar}  \033[1m{used}% usado\033[0m · {remaining}% restante · Resets {reset}{warn}")
+    return True
+
+
 def cmd_status(target: str = ""):
     creds = list_credentials()
     active = get_active_credential()
@@ -669,6 +887,8 @@ def cmd_status(target: str = ""):
     print("╰─────────────────────────────────────────────────────────────╯")
     if active:
         print(f"  • Cuenta activa : \033[1;32m{active['label']}\033[0m  \033[2m[{active['integration_id']}]\033[0m")
+
+    has_go_plus = _print_go_plus_windows(active if not target else next((c for c in creds if c["label"].strip().lower() == target.strip().lower()), active))
 
     if target:
         creds = [c for c in creds if c["label"].strip().lower() == target.strip().lower()
@@ -691,8 +911,12 @@ def cmd_status(target: str = ""):
                 mt = m["input"] + m["output"] + m["reasoning"]
                 print(f"        - {mid:<28} ${m['cost']:.4f} · {mt:,} tokens")
 
-    print("\n  💡 OpenCode no expone saldo ni límites de cuota por API; el consumo")
-    print("     mostrado es el registro real local de sesiones (opencode.db).\n")
+    if has_go_plus:
+        print("\n  💡 Cuota Go Plus consultada en vivo a la API oficial de uso de OpenCode.")
+        print("     El consumo inferior es el registro real local de sesiones (opencode.db).\n")
+    else:
+        print("\n  💡 Sin cuota Go Plus visible (cuenta sin plan Go Plus o API key no encontrada")
+        print("     en OpenCode ni en Pi). El consumo mostrado es el registro local (opencode.db).\n")
 
 
 def cmd_login(nombre: str = "", force: bool = False):
@@ -830,6 +1054,7 @@ def main():
                     "active_session_detection": True,
                     "refresh_persistence_errors": False,
                     "local_token_telemetry": True,
+                    "external_quota_api": True,
                 },
             }, indent=2))
             sys.exit(0)
@@ -878,6 +1103,7 @@ def main():
                 "active_session_detection": True,
                 "refresh_persistence_errors": False,
                 "local_token_telemetry": True,
+                "external_quota_api": True,
             },
         }, indent=2))
         sys.exit(0)

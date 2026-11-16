@@ -1,5 +1,5 @@
 # Guía de Integración para Nuevos Agentes y Proveedores CLI
-<!-- switch:version=1.2.0 -->
+<!-- switch:version=1.3.0 -->
 
 > **Mensaje para el Agente / Modelo de IA (DeepSeek, OpenCode, Claude, etc.):**  
 > Si estás leyendo este archivo porque el usuario te indicó *"Lee este archivo para integrarte a Switch"*, estás en el lugar correcto.  
