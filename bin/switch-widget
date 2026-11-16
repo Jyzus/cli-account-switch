@@ -57,6 +57,7 @@ def load_cli_module(name: str):
 
 CODEX_MOD = load_cli_module("codex-switch")
 AGY_MOD = load_cli_module("agy-switch")
+OPENCODE_MOD = load_cli_module("opencode-switch")
 
 # ==============================================================================
 # PROVEEDORES DE CUENTAS (EXTENSIBLES)
@@ -401,10 +402,124 @@ class AgyProvider(BaseProvider):
         return False, res.stderr.strip() or res.stdout.strip() or "Error al eliminar perfil"
 
 
+class OpencodeProvider(BaseProvider):
+    id = "opencode"
+    name = "OpenCode"
+    badge = "OPENCODE"
+    cli_cmd = "opencode-switch"
+    color = "#f59e0b"
+
+    def is_available(self) -> bool:
+        return OPENCODE_MOD is not None
+
+    def get_running_clients(self) -> list:
+        if OPENCODE_MOD and hasattr(OPENCODE_MOD, "find_running_clients"):
+            try:
+                return OPENCODE_MOD.find_running_clients("opencode")
+            except Exception:
+                pass
+        return []
+
+    def get_status(self) -> dict:
+        if not OPENCODE_MOD:
+            return {
+                "id": self.id,
+                "name": self.name,
+                "badge": self.badge,
+                "color": self.color,
+                "error": "Módulo opencode-switch no encontrado",
+                "accounts": [],
+            }
+
+        try:
+            creds = OPENCODE_MOD.list_credentials()
+            usage = OPENCODE_MOD.read_usage_totals()
+        except Exception as e:
+            return {
+                "id": self.id,
+                "name": self.name,
+                "badge": self.badge,
+                "color": self.color,
+                "error": str(e),
+                "accounts": [],
+            }
+
+        def tokens_for_provider(integration_id: str) -> dict:
+            # El integration_id de la credencial suele mapear al providerID de las sesiones.
+            t = usage.get(integration_id) or {}
+            total = int(t.get("input", 0)) + int(t.get("output", 0)) + int(t.get("reasoning", 0))
+            return {
+                "cost": float(t.get("cost", 0.0)),
+                "input": int(t.get("input", 0)),
+                "output": int(t.get("output", 0)),
+                "reasoning": int(t.get("reasoning", 0)),
+                "cache_read": int(t.get("cache_read", 0)),
+                "cache_write": int(t.get("cache_write", 0)),
+                "sessions": int(t.get("sessions", 0)),
+                "total": total,
+            }
+
+        accounts = []
+        for c in creds:
+            label = c.get("label") or "(sin etiqueta)"
+            t = tokens_for_provider(c.get("integration_id") or "opencode")
+            accounts.append({
+                "name": label,
+                "provider": self.id,
+                "provider_name": self.name,
+                "email": label,
+                "plan": (c.get("integration_id") or "OPENCODE").upper(),
+                "is_active": bool(c.get("active")),
+                "error": None,
+                "status": "available",
+                "status_text": "Disponible",
+                "tokens": t,
+            })
+
+        return {
+            "id": self.id,
+            "name": self.name,
+            "badge": self.badge,
+            "cli_cmd": self.cli_cmd,
+            "color": self.color,
+            "active_profile": next((c.get("label") for c in creds if c.get("active")), ""),
+            "active_email": next((c.get("label") for c in creds if c.get("active")), ""),
+            "accounts": accounts,
+        }
+
+    def switch_account(self, name: str, force: bool = False) -> tuple[bool, str, list]:
+        mod_file = find_module_file("opencode-switch")
+        if not mod_file:
+            return False, "Ejecutable opencode-switch no encontrado", []
+        cmd = [sys.executable, str(mod_file), "usar", name]
+        if force:
+            cmd.append("--force")
+
+        running = self.get_running_clients()
+        if running and not force:
+            return False, f"Se detectaron {len(running)} sesiones activas de OpenCode", running
+
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Cuenta cambiada con éxito a '{name}'", []
+        return False, res.stderr.strip() or res.stdout.strip() or "Error al cambiar cuenta", running
+
+    def delete_account(self, name: str) -> tuple[bool, str]:
+        mod_file = find_module_file("opencode-switch")
+        if not mod_file:
+            return False, "Ejecutable opencode-switch no encontrado"
+        cmd = [sys.executable, str(mod_file), "eliminar", name]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Cuenta '{name}' eliminada con éxito"
+        return False, res.stderr.strip() or res.stdout.strip() or "Error al eliminar cuenta"
+
+
 # Registro de proveedores (fácilmente extensible para futuros modelos)
 PROVIDERS: dict[str, BaseProvider] = {
     "codex": CodexProvider(),
     "agy": AgyProvider(),
+    "opencode": OpencodeProvider(),
 }
 
 # ==============================================================================
@@ -433,6 +548,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       --accent-hover: #4f46e5;
       --codex: #10b981;
       --agy: #8b5cf6;
+      --opencode: #f59e0b;
       --green: #10b981;
       --amber: #f59e0b;
       --red: #ef4444;
@@ -826,6 +942,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       background: rgba(139, 92, 246, 0.18);
       color: #c084fc;
       border: 1px solid rgba(139, 92, 246, 0.35);
+    }
+
+    .provider-opencode {
+      background: rgba(245, 158, 11, 0.18);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.35);
     }
 
     .active-badge {
@@ -1401,6 +1523,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <button class="tab-btn" data-filter="agy">
           Google AGY <span class="tab-count" id="count-agy">0</span>
         </button>
+        <button class="tab-btn" data-filter="opencode">
+          OpenCode <span class="tab-count" id="count-opencode">0</span>
+        </button>
       </div>
 
       <div class="search-box">
@@ -1426,7 +1551,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <!-- Footer -->
     <footer>
       <div>Sincronizado con CLI Account Switch · Servidor local 127.0.0.1</div>
-      <div>Compatible con <span class="code-pill">codex-switch</span> y <span class="code-pill">agy-switch</span></div>
+      <div>Compatible con <span class="code-pill">codex-switch</span>, <span class="code-pill">agy-switch</span> y <span class="code-pill">opencode-switch</span></div>
     </footer>
   </div>
 
@@ -1605,12 +1730,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       let active = 0;
       let codexCount = 0;
       let agyCount = 0;
+      let opencodeCount = 0;
 
       (appData.providers || []).forEach(p => {
         (p.accounts || []).forEach(acc => {
           total++;
           if (acc.provider === "codex") codexCount++;
           if (acc.provider === "agy") agyCount++;
+          if (acc.provider === "opencode") opencodeCount++;
           if (acc.is_active) active++;
           if (acc.status === "available") ready++;
         });
@@ -1622,6 +1749,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       document.getElementById("count-all").textContent = total;
       document.getElementById("count-codex").textContent = codexCount;
       document.getElementById("count-agy").textContent = agyCount;
+      document.getElementById("count-opencode").textContent = opencodeCount;
     }
 
     // Renderizar tarjetas de cuentas
@@ -1657,7 +1785,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </svg>
             <h3>No se encontraron cuentas</h3>
             <p>No hay cuentas que coincidan con el filtro actual o aún no has guardado perfiles.</p>
-            <p style="font-size: 12px;">Para registrar una: <span class="code-pill">codex-switch guardar &lt;alias&gt;</span> o <span class="code-pill">agy-switch guardar &lt;alias&gt;</span></p>
+            <p style="font-size: 12px;">Para registrar una: <span class="code-pill">codex-switch guardar &lt;alias&gt;</span>, <span class="code-pill">agy-switch guardar &lt;alias&gt;</span> o <span class="code-pill">opencode-switch login &lt;alias&gt;</span></p>
           </div>
         `;
         return;
@@ -1665,7 +1793,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       accountsContainer.innerHTML = filtered.map(acc => {
         const isCodex = acc.provider === "codex";
-        const providerClass = isCodex ? "provider-codex" : "provider-agy";
+        const isOpencode = acc.provider === "opencode";
+        const providerClass = isCodex ? "provider-codex" : (isOpencode ? "provider-opencode" : "provider-agy");
         const statusClass = acc.status || "available";
 
         // Barras y cuotas
@@ -1740,6 +1869,39 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               </div>
             `;
           }
+        } else if (isOpencode) {
+          // OpenCode: consumo de tokens y coste local (sin cuota/saldo externo)
+          const t = acc.tokens || {};
+          quotasHtml = `
+            <div class="quota-item">
+              <div class="quota-header">
+                <span class="quota-title">⚡ Consumo acumulado</span>
+                <span class="quota-fraction" style="color: #fbbf24;">
+                  $${(t.cost || 0).toFixed(4)}
+                </span>
+              </div>
+              <div class="quota-footer">
+                <span>${(t.total || 0).toLocaleString()} tokens</span>
+                <span>${t.sessions || 0} sesión(es)</span>
+              </div>
+            </div>
+            <div class="quota-item">
+              <div class="quota-header">
+                <span class="quota-title">Tokens (in / out / razón)</span>
+              </div>
+              <div class="quota-footer">
+                <span>${(t.input || 0).toLocaleString()} / ${(t.output || 0).toLocaleString()} / ${(t.reasoning || 0).toLocaleString()}</span>
+              </div>
+            </div>
+            <div class="quota-item">
+              <div class="quota-header">
+                <span class="quota-title">Cache (read / write)</span>
+              </div>
+              <div class="quota-footer">
+                <span>${(t.cache_read || 0).toLocaleString()} / ${(t.cache_write || 0).toLocaleString()}</span>
+              </div>
+            </div>
+          `;
         } else {
           // AGY Quotas
           const gm = acc.gemini;
@@ -2145,7 +2307,7 @@ def main():
     parser.add_argument("-v", "--version", action="version", version=f"CLI Account Switch Desktop Widget v{VERSION}")
     parser.add_argument("-p", "--port", type=int, default=4920, help="Puerto local del servidor (por defecto 4920)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host al que vincular el servidor (por defecto 127.0.0.1)")
-    parser.add_argument("-f", "--filter", type=str, choices=["all", "codex", "agy"], default="all", help="Filtro predeterminado")
+    parser.add_argument("-f", "--filter", type=str, choices=["all", "codex", "agy", "opencode"], default="all", help="Filtro predeterminado")
     parser.add_argument("--no-browser", action="store_true", help="No abrir la interfaz gráfica automáticamente")
     parser.add_argument("--browser-tab", action="store_true", help="Abrir como pestaña del navegador en vez de ventana de app dedicada")
 
@@ -2166,7 +2328,7 @@ def main():
     print("│  ✦ CLI Account Switch · Desktop Widget                      │")
     print("╰─────────────────────────────────────────────────────────────╯")
     print(f"  • URL Local    : \033[1;36m{url}\033[0m")
-    print("  • Proveedores  : \033[1;32mOpenAI Codex\033[0m & \033[1;35mGoogle Antigravity (AGY)\033[0m")
+    print("  • Proveedores  : \033[1;32mOpenAI Codex\033[0m, \033[1;35mGoogle Antigravity (AGY)\033[0m y \033[1;33mOpenCode\033[0m")
     print("  • Actualización: Automática en vivo + botón manual")
     print("  • Métricas     : Cuotas 5h, Consumo Semanal (7d) y Tiempo de Reinicio")
     print("  • Detener      : Presiona Ctrl+C en esta terminal\n")

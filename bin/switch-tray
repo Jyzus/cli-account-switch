@@ -278,6 +278,7 @@ def format_duration(sec: int) -> str:
 def fetch_tray_status() -> dict:
     codex_mod = load_cli_module("codex-switch")
     agy_mod = load_cli_module("agy-switch")
+    opencode_mod = load_cli_module("opencode-switch")
 
     status = {
         "timestamp": int(time.time()),
@@ -297,6 +298,15 @@ def fetch_tray_status() -> dict:
             "gemini_pct": None,
             "claude_pct": None,
             "reset_str": "",
+            "error": None,
+            "all_accounts": [],
+            "accounts": [],
+        },
+        "opencode": {
+            "active_name": "",
+            "active_email": "",
+            "cost": None,
+            "tokens": None,
             "error": None,
             "all_accounts": [],
             "accounts": [],
@@ -476,6 +486,61 @@ def fetch_tray_status() -> dict:
         except Exception as e:
             status["agy"]["error"] = str(e)
 
+    # 3. OpenCode (consumo local de tokens y coste)
+    if opencode_mod:
+        try:
+            creds = opencode_mod.list_credentials()
+            usage = opencode_mod.read_usage_totals()
+            active = next((c for c in creds if c.get("active")), None)
+
+            status["opencode"]["active_name"] = (active.get("label") if active else "") or "sin cuenta"
+            status["opencode"]["active_email"] = (active.get("label") if active else "")
+            status["opencode"]["all_accounts"] = [c.get("label") for c in creds]
+
+            def fetch_one_opencode(c: dict) -> dict:
+                label = c.get("label") or "(sin etiqueta)"
+                t = (usage or {}).get(c.get("integration_id") or "opencode") or {}
+                total = int(t.get("input", 0)) + int(t.get("output", 0)) + int(t.get("reasoning", 0))
+
+                # Desglose por modelo, ordenado por coste descendente.
+                models = []
+                for mid, m in sorted(
+                    (t.get("models") or {}).items(),
+                    key=lambda kv: -float(kv[1].get("cost", 0.0)),
+                ):
+                    mt = int(m.get("input", 0)) + int(m.get("output", 0)) + int(m.get("reasoning", 0))
+                    models.append({
+                        "model": mid,
+                        "cost": float(m.get("cost", 0.0)),
+                        "tokens": mt,
+                        "input": int(m.get("input", 0)),
+                        "output": int(m.get("output", 0)),
+                        "reasoning": int(m.get("reasoning", 0)),
+                    })
+
+                return {
+                    "name": label,
+                    "is_active": bool(c.get("active")),
+                    "email": label,
+                    "plan": (c.get("integration_id") or "OPENCODE").upper(),
+                    "cost": float(t.get("cost", 0.0)),
+                    "tokens": total,
+                    "models": models,
+                    "error": None,
+                }
+
+            with ThreadPoolExecutor(max_workers=min(len(creds), 4) or 1) as pool:
+                oc_accs = list(pool.map(fetch_one_opencode, creds))
+
+            status["opencode"]["accounts"] = oc_accs
+            active_acc = next((a for a in oc_accs if a["is_active"]), None) or (oc_accs[0] if oc_accs else None)
+            if active_acc:
+                status["opencode"]["cost"] = active_acc.get("cost")
+                status["opencode"]["tokens"] = active_acc.get("tokens")
+                status["opencode"]["error"] = active_acc.get("error")
+        except Exception as e:
+            status["opencode"]["error"] = str(e)
+
     return status
 
 
@@ -510,6 +575,18 @@ def format_account_label(provider: str, acc: dict) -> str:
             parts.append(f"{c_pct}%")
         if w_pct is not None:
             parts.append(f"{w_pct}% sem")
+
+        pct_text = " | ".join(parts) if parts else "N/A"
+        return f"{prefix}{name} · {pct_text}"
+    elif provider == "opencode":
+        cost = acc.get("cost")
+        tokens = acc.get("tokens")
+
+        parts = []
+        if cost is not None:
+            parts.append(f"${cost:.4f}")
+        if tokens is not None:
+            parts.append(f"{tokens:,} tok")
 
         pct_text = " | ".join(parts) if parts else "N/A"
         return f"{prefix}{name} · {pct_text}"
@@ -602,9 +679,11 @@ class LinuxAppIndicatorTray:
         self.current_status = data
         codex = data.get("codex", {})
         agy = data.get("agy", {})
+        opencode = data.get("opencode", {})
 
         c_pct = codex.get("available_pct")
         g_pct = agy.get("gemini_pct")
+        o_cost = opencode.get("cost")
 
         # Texto del panel en la barra de tareas
         labels = []
@@ -618,12 +697,17 @@ class LinuxAppIndicatorTray:
         elif agy.get("error"):
             labels.append("AGY: ⚠️")
 
+        if o_cost is not None:
+            labels.append(f"OpenCode: ${o_cost:.3f}")
+        elif opencode.get("error"):
+            labels.append("OpenCode: ⚠️")
+
         panel_text = " | ".join(labels) if labels else "AI Tokens"
         self.indicator.set_label(panel_text, "Codex: 100% | AGY: 100%")
 
         # Determinar icono según el peor porcentaje
         all_pcts = [p for p in (c_pct, g_pct) if p is not None]
-        if codex.get("error") or agy.get("error"):
+        if codex.get("error") or agy.get("error") or opencode.get("error"):
             icon_key = "error"
         elif not all_pcts:
             icon_key = "yellow"
@@ -670,6 +754,7 @@ class LinuxAppIndicatorTray:
         menu = Gtk.Menu()
         codex = self.current_status.get("codex", {})
         agy = self.current_status.get("agy", {})
+        opencode = self.current_status.get("opencode", {})
 
         # ==========================================
         # SECCIÓN 1: OPENAI CODEX
@@ -708,6 +793,24 @@ class LinuxAppIndicatorTray:
         menu.append(Gtk.SeparatorMenuItem())
 
         # ==========================================
+        # SECCIÓN 3: OPENCODE
+        # ==========================================
+        h_opencode = Gtk.MenuItem(label="-------- OpenCode --------")
+        h_opencode.set_sensitive(False)
+        menu.append(h_opencode)
+
+        o_accounts = (opencode.get("accounts") or [])[:3]
+        if not o_accounts:
+            empty_o = Gtk.MenuItem(label="  (Sin cuentas guardadas)")
+            empty_o.set_sensitive(False)
+            menu.append(empty_o)
+        else:
+            for acc in o_accounts:
+                menu.append(self._create_account_item("opencode", acc))
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # ==========================================
         # ÚNICO BOTÓN EXTRA: ABRIR MONITOR
         # ==========================================
         item_monitor = Gtk.MenuItem(label="📊 Abrir Monitor")
@@ -722,7 +825,7 @@ class LinuxAppIndicatorTray:
     def _make_switch_cb(self, provider: str, account: str):
         def cb(_):
             def worker():
-                mod_name = "codex-switch" if provider == "codex" else "agy-switch"
+                mod_name = {"codex": "codex-switch", "agy": "agy-switch", "opencode": "opencode-switch"}.get(provider, "codex-switch")
                 mod = load_cli_module(mod_name)
                 if mod and hasattr(mod, "find_running_clients"):
                     try:
@@ -957,6 +1060,7 @@ def main():
         data = fetch_tray_status()
         codex = data.get("codex", {})
         agy = data.get("agy", {})
+        opencode = data.get("opencode", {})
 
         print("\n╭─────────────────────────────────────────────────────────────╮")
         print("│  ✦ Estado de Tokens por Proveedor (Top 3 Cuentas)           │")
@@ -1007,6 +1111,27 @@ def main():
                 c_res = acc.get("claude_reset_str") or "reseteado"
                 print(f"              • Gemini Models (5h)  : \033[1m{g_pct}%\033[0m disp · {g_used}% usado (resetea en: {g_res})")
                 print(f"              • Claude 3P / Semanal : \033[1m{c_pct}%\033[0m disp · {c_used}% usado (resetea en: {c_res})")
+
+        print("\n  \033[1;33m🟠 OPENCODE (Consumo Local de Tokens y Coste)\033[0m")
+        o_accs = opencode.get("accounts") or []
+        if not o_accs:
+            print("    (No hay cuentas guardadas. Usa: opencode-switch login <alias>)")
+        for acc in o_accs:
+            name = acc.get("name")
+            is_act = acc.get("is_active")
+            plan = acc.get("plan") or "OPENCODE"
+            star = "\033[1;33m★ [ACTIVA]\033[0m" if is_act else " " * 10
+            print(f"  {star} \033[1m{name:16}\033[0m [{plan}]")
+            if acc.get("error"):
+                print(f"              ⚠️  \033[1;31m{acc.get('error')}\033[0m")
+            else:
+                cost = acc.get("cost", 0.0)
+                tokens = acc.get("tokens", 0)
+                print(f"              • Coste acumulado : \033[1m${cost:.4f}\033[0m")
+                print(f"              • Tokens totales  : \033[1m{tokens:,}\033[0m")
+                for m in (acc.get("models") or []):
+                    mt = int(m.get("tokens", 0))
+                    print(f"                └ \033[2m{m['model']:<22}\033[0m \033[1m${m['cost']:.4f}\033[0m · {mt:,} tok")
 
         running_pid = get_running_pid()
         st_proc = f"\033[1;32mACTIVO\033[0m (PID: {running_pid})" if running_pid else "\033[1;33mDETENIDO\033[0m"

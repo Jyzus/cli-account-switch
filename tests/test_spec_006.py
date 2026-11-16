@@ -98,9 +98,9 @@ def test_switch_cuentas_json_no_secrets(isolated_env):
     assert "agy" in provs
     assert "opencode" in provs
 
-    # OpenCode debe reportar unsupported_capability
-    assert provs["opencode"]["disponible"] is False
-    assert provs["opencode"].get("capacidad") == "unsupported_capability"
+    # OpenCode ahora cuenta con adaptador; en un entorno sin BD reporta lista vacía.
+    assert "disponible" in provs["opencode"]
+    assert "cuentas" in provs["opencode"]
 
     # Emails enmascarados
     codex_accounts = provs["codex"]["cuentas"]
@@ -127,7 +127,8 @@ def test_switch_cuota_json_safe_readonly(isolated_env):
     provs = data["proveedores"]
     assert "codex" in provs
     assert "agy" in provs
-    assert provs["opencode"]["capacidad"] == "unsupported_capability"
+    assert "opencode" in provs
+    assert "cuotas" in provs["opencode"]
 
     # Verificar que los archivos activos en disco no sufrieron modificación alguna
     assert codex_auth.read_bytes() == codex_before
@@ -147,7 +148,8 @@ def test_switch_ocupacion_json(isolated_env):
     assert "agy" in provs
     assert "ocupado" in provs["codex"]
     assert "puede_conmutar" in provs["codex"]
-    assert provs["opencode"]["capacidad"] == "unsupported_capability"
+    assert "opencode" in provs
+    assert "puede_conmutar" in provs["opencode"]
 
 
 def test_switch_seleccionar_dry_run_and_active_session(isolated_env):
@@ -225,8 +227,8 @@ def test_switch_paralelo_unified(isolated_env):
     assert "OK_CODEX_principal" in res_codex.stdout
 
 
-def test_switch_opencode_unsupported_and_filters(isolated_env):
-    """Verifica filtro por proveedor y reporte unsupported_capability para OpenCode."""
+def test_switch_opencode_filters_and_seleccionar(isolated_env):
+    """Verifica filtro por proveedor y conmutación de OpenCode (ahora soportado)."""
     # Filtro específico hacia opencode en cuentas
     cmd_cuentas = [sys.executable, str(SWITCH_CLI), "cuentas", "opencode", "--json"]
     res_cuentas = subprocess.run(cmd_cuentas, env=isolated_env["env"], capture_output=True, text=True)
@@ -234,7 +236,7 @@ def test_switch_opencode_unsupported_and_filters(isolated_env):
     d_cuentas = json.loads(res_cuentas.stdout)
     assert "opencode" in d_cuentas["proveedores"]
     assert "codex" not in d_cuentas["proveedores"]
-    assert d_cuentas["proveedores"]["opencode"]["capacidad"] == "unsupported_capability"
+    assert "disponible" in d_cuentas["proveedores"]["opencode"]
 
     # Filtro específico hacia opencode en cuota
     cmd_cuota = [sys.executable, str(SWITCH_CLI), "cuota", "opencode", "--json"]
@@ -242,15 +244,16 @@ def test_switch_opencode_unsupported_and_filters(isolated_env):
     assert res_cuota.returncode == 0, f"Stderr: {res_cuota.stderr}"
     d_cuota = json.loads(res_cuota.stdout)
     assert "opencode" in d_cuota["proveedores"]
-    assert d_cuota["proveedores"]["opencode"]["capacidad"] == "unsupported_capability"
+    assert "cuotas" in d_cuota["proveedores"]["opencode"] or "cuentas" in d_cuota["proveedores"]["opencode"]
 
-    # Intento de selección en OpenCode
+    # Intento de selección de una cuenta inexistente en OpenCode
     cmd_sel = [sys.executable, str(SWITCH_CLI), "seleccionar", "opencode", "default", "--json"]
     res_sel = subprocess.run(cmd_sel, env=isolated_env["env"], capture_output=True, text=True)
     assert res_sel.returncode != 0
     d_sel = json.loads(res_sel.stdout)
     assert d_sel["permitido"] is False
-    assert d_sel["codigo"] == "unsupported_capability"
+    # En un entorno sin cuentas de OpenCode el resultado es invalid_auth (no unsupported).
+    assert d_sel["codigo"] == "invalid_auth"
 
 
 def test_subcli_direct_json_contracts(isolated_env):

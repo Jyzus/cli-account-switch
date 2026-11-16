@@ -78,12 +78,25 @@ def cmd_version():
         except Exception:
             agy_ver = "Instalado"
 
+    opencode_ver = "No instalado"
+    opencode_path = shutil.which("opencode")
+    if opencode_path:
+        try:
+            r = subprocess.run(["opencode", "--version"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                opencode_ver = r.stdout.strip().splitlines()[0].strip()
+            else:
+                opencode_ver = "Instalado"
+        except Exception:
+            opencode_ver = "Instalado"
+
     print(f"\n╭─────────────────────────────────────────────────────────────╮")
     print(f"│  ✦ CLI Account Switch v{VERSION:<36}│")
     print(f"╰─────────────────────────────────────────────────────────────╯")
     print(f"  • Suite Switch : \033[1;32mv{VERSION}\033[0m")
     print(f"  • OpenAI Codex : \033[1;36m{codex_ver}\033[0m")
     print(f"  • Google AGY   : \033[1;35m{agy_ver}\033[0m")
+    print(f"  • OpenCode     : \033[1;33m{opencode_ver}\033[0m")
     print(f"  • Repositorio  : https://github.com/{GITHUB_REPO}\n")
     print(f"  🔄 Para actualizar Switch, Codex y AGY:")
     print(f"     \033[1;33mswitch actualizar\033[0m\n")
@@ -219,10 +232,18 @@ def cmd_status(target: str = ""):
         print("===============================================================")
         subprocess.run([sys.executable, str(agy_tool), "status"] + ([target] if target else []))
 
+    opencode_tool = find_tool("opencode-switch")
+    if opencode_tool:
+        print("\n===============================================================")
+        print("  OPENCODE · CONSUMO DE TOKENS Y COSTE (LOCAL)")
+        print("===============================================================")
+        subprocess.run([sys.executable, str(opencode_tool), "status"] + ([target] if target else []))
+
 
 def cmd_listar():
     codex_tool = find_tool("codex-switch")
     agy_tool = find_tool("agy-switch")
+    opencode_tool = find_tool("opencode-switch")
 
     if codex_tool:
         print("\n--- Perfiles de OpenAI Codex ---")
@@ -231,6 +252,10 @@ def cmd_listar():
     if agy_tool:
         print("\n--- Perfiles de Google Antigravity ---")
         subprocess.run([sys.executable, str(agy_tool), "listar"])
+
+    if opencode_tool:
+        print("\n--- Cuentas de OpenCode ---")
+        subprocess.run([sys.executable, str(opencode_tool), "listar"])
 
 
 def run_tool_json(tool_name: str, args: list[str]) -> dict | None:
@@ -269,11 +294,11 @@ def cmd_cuentas_json(provider_filter: str = ""):
             "error": "No disponible"
         }
     if include_opencode:
-        proveedores["opencode"] = {
+        proveedores["opencode"] = run_tool_json("opencode-switch", ["cuentas", "--json"]) or {
             "disponible": False,
-            "capacidad": "unsupported_capability",
-            "mensaje": "OpenCode no cuenta con adaptador de cuentas o cuota en Switch.",
-            "cuentas": []
+            "perfil_activo": "",
+            "cuentas": [],
+            "error": "No disponible"
         }
 
     return {
@@ -291,6 +316,7 @@ def cmd_cuota_json(target: str = "", provider_filter: str = ""):
 
     codex_args = ["cuota", "--json"] + ([target] if target else [])
     agy_args = ["cuota", "--json"] + ([target] if target else [])
+    opencode_args = ["cuota", "--json"] + ([target] if target else [])
 
     proveedores = {}
     if include_codex:
@@ -308,11 +334,11 @@ def cmd_cuota_json(target: str = "", provider_filter: str = ""):
             "error": "No disponible"
         }
     if include_opencode:
-        proveedores["opencode"] = {
+        proveedores["opencode"] = run_tool_json("opencode-switch", opencode_args) or {
             "disponible": False,
-            "capacidad": "unsupported_capability",
-            "mensaje": "OpenCode no cuenta con adaptador de cuentas o cuota en Switch.",
-            "cuentas": []
+            "perfil_activo": "",
+            "cuentas": [],
+            "error": "No disponible"
         }
 
     return {
@@ -342,10 +368,10 @@ def cmd_ocupacion_json(provider_filter: str = ""):
             "error": "agy-switch no disponible"
         }
     if include_opencode:
-        proveedores["opencode"] = {
+        proveedores["opencode"] = run_tool_json("opencode-switch", ["ocupacion", "--json"]) or {
             "ocupado": False,
-            "capacidad": "unsupported_capability",
-            "puede_conmutar": False
+            "puede_conmutar": False,
+            "error": "opencode-switch no disponible"
         }
 
     return {
@@ -358,9 +384,11 @@ def cmd_ocupacion_json(provider_filter: str = ""):
 def cmd_preflight_json() -> dict:
     codex_tool = find_tool("codex-switch")
     agy_tool = find_tool("agy-switch")
+    opencode_tool = find_tool("opencode-switch")
 
     codex_avail = codex_tool is not None
     agy_avail = agy_tool is not None
+    opencode_avail = opencode_tool is not None
 
     return {
         "protocol_version": 1,
@@ -388,12 +416,12 @@ def cmd_preflight_json() -> dict:
                 "refresh_persistence_errors": True
             },
             "opencode": {
-                "soportado": False,
+                "soportado": opencode_avail,
                 "parallel": False,
-                "active_session_detection": False,
+                "active_session_detection": True,
                 "identity_reservation": False,
                 "refresh_persistence_errors": False,
-                "razon": "adaptador_no_implementado"
+                "local_token_telemetry": True
             }
         }
     }
@@ -402,11 +430,15 @@ def cmd_preflight_json() -> dict:
 def cmd_seleccionar_json(prov: str, cuenta: str, dry_run: bool = False):
     prov = prov.lower()
     if prov in ("opencode",):
+        args = ["seleccionar", cuenta, "--json"] + (["--dry-run"] if dry_run else [])
+        res = run_tool_json("opencode-switch", args)
+        if res:
+            return res
         return {
             "solicitud": {"proveedor": "opencode", "cuenta_destino": cuenta, "dry_run": dry_run},
             "permitido": False,
-            "codigo": "unsupported_capability",
-            "mensaje": "OpenCode no cuenta con soporte en Switch para conmutación de cuentas.",
+            "codigo": "invalid_auth",
+            "mensaje": "Error al comunicar con opencode-switch",
             "bloqueo_adquirido": False,
             "cambio_realizado": False
         }
@@ -545,7 +577,7 @@ def main():
             print("❌ Error: OpenCode no cuenta con adaptador de ejecución paralela en Switch.", file=sys.stderr)
             sys.exit(1)
         else:
-            print(f"❌ Error: Proveedor desconocido '{prov}'. Usa 'agy' o 'codex'.", file=sys.stderr)
+            print(f"❌ Error: Proveedor desconocido '{prov}'. Usa 'agy', 'codex' u 'opencode'.", file=sys.stderr)
             sys.exit(1)
     elif args[0] in ("tray", "barra", "taskbar"):
         exec_subcommand("switch-tray", args[1:])
@@ -559,6 +591,8 @@ def main():
         exec_subcommand("codex-switch", args[1:])
     elif args[0] in ("agy", "antigravity", "gemini"):
         exec_subcommand("agy-switch", args[1:])
+    elif args[0] in ("opencode",):
+        exec_subcommand("opencode-switch", args[1:])
     elif args[0] in ("listar", "list", "ls"):
         cmd_listar()
     elif args[0] in ("agregar", "add"):
@@ -567,13 +601,17 @@ def main():
             exec_subcommand("codex-switch", ["agregar"] + args[2:])
         elif len(args) > 1 and args[1] in ("agy", "antigravity"):
             exec_subcommand("agy-switch", ["agregar"] + args[2:])
+        elif len(args) > 1 and args[1] in ("opencode",):
+            exec_subcommand("opencode-switch", ["login"] + args[2:])
         else:
             print("Uso para agregar cuenta:")
             print("  switch codex agregar <nombre> [--device-auth] [--desde <archivo>]")
             print("  switch agy agregar <nombre> [--desde <archivo>]")
+            print("  switch opencode login <alias>")
             print("\nO usa directamente:")
             print("  codex-switch agregar <nombre>")
             print("  agy-switch agregar <nombre>")
+            print("  opencode-switch login <alias>")
             sys.exit(1)
     elif args[0] in ("guardar", "save"):
         if len(args) > 1 and args[1] in ("codex", "openai"):
@@ -582,6 +620,7 @@ def main():
             exec_subcommand("agy-switch", ["guardar"] + args[2:])
         else:
             print("Uso: switch codex guardar <nombre>  o  switch agy guardar <nombre>")
+            print("     (OpenCode gestiona sus cuentas de forma nativa: switch opencode login <alias>)")
             sys.exit(1)
     elif args[0] in ("reautenticar", "reauth", "login"):
         positionals = [a for a in args[1:] if not a.startswith("-")]
@@ -589,7 +628,7 @@ def main():
         prov = ""
         nombre = ""
         if positionals:
-            if positionals[0] in ("codex", "openai", "agy", "antigravity", "gemini"):
+            if positionals[0] in ("codex", "openai", "agy", "antigravity", "gemini", "opencode"):
                 prov = positionals[0]
                 if len(positionals) > 1:
                     nombre = positionals[1]
@@ -603,6 +642,8 @@ def main():
             exec_subcommand("codex-switch", ["reautenticar", nombre] + options if nombre else ["reautenticar"] + options)
         elif prov in ("agy", "antigravity", "gemini"):
             exec_subcommand("agy-switch", ["reautenticar", nombre] + options if nombre else ["reautenticar"] + options)
+        elif prov in ("opencode",):
+            exec_subcommand("opencode-switch", ["reautenticar", nombre] + options if nombre else ["login"] + options)
         elif nombre:
             in_codex = (codex_home / "cuentas" / f"{nombre}.json").is_file()
             in_agy = (agy_home / "cuentas" / f"{nombre}.token").is_file()
@@ -642,22 +683,26 @@ def main():
             print(f"Especifica la herramienta con: switch codex usar {alias}  o  switch agy usar {alias}")
             sys.exit(1)
         else:
-            print(f"❌ Error: El perfil '{alias}' no existe en cuentas de Codex ni de AGY.")
-            print("Usa: switch listar")
-            sys.exit(1)
+            # No existe en Codex ni AGY: probar con OpenCode (gestión nativa de cuentas).
+            exec_subcommand("opencode-switch", ["usar"] + args[1:])
     elif args[0] in ("eliminar", "borrar", "rm"):
         if len(args) > 1 and args[1] in ("codex", "openai"):
             exec_subcommand("codex-switch", ["eliminar"] + args[2:])
         elif len(args) > 1 and args[1] in ("agy", "antigravity"):
             exec_subcommand("agy-switch", ["eliminar"] + args[2:])
+        elif len(args) > 1 and args[1] in ("opencode",):
+            exec_subcommand("opencode-switch", ["eliminar"] + args[2:])
         else:
-            print("Uso: switch codex eliminar <nombre>  o  switch agy eliminar <nombre>")
+            print("Uso: switch codex eliminar <nombre>  ·  switch agy eliminar <nombre>  ·  switch opencode eliminar <nombre>")
             sys.exit(1)
     elif args[0] in ("renombrar", "mv"):
         if len(args) > 1 and args[1] in ("codex", "openai"):
             exec_subcommand("codex-switch", ["renombrar"] + args[2:])
         elif len(args) > 1 and args[1] in ("agy", "antigravity"):
             exec_subcommand("agy-switch", ["renombrar"] + args[2:])
+        elif len(args) > 1 and args[1] in ("opencode",):
+            print("ℹ️ OpenCode no expone renombrado de cuentas por CLI; usa 'opencode auth list' desde la UI.")
+            sys.exit(1)
         else:
             print("Uso: switch codex renombrar <actual> <nuevo>  o  switch agy renombrar <actual> <nuevo>")
             sys.exit(1)
@@ -667,15 +712,16 @@ def main():
         print("  tray [start|stop|restart|show] Inicia, gestiona o despliega el panel flotante estético")
         print("  tray --autostart enable     Ancla el widget para que inicie automáticamente con el PC")
         print("  widget                      Abre el monitor gráfico de escritorio (dashboard)")
-        print("  status [nombre]             Consulta cuotas y tokens en vivo de Codex y AGY")
-        print("  listar                      Lista todas las cuentas guardadas de Codex y AGY (offline)")
-        print("  usar <nombre>               Cambia a la cuenta indicada (detecta Codex o AGY)")
+        print("  status [nombre]             Consulta cuotas y tokens en vivo de Codex, AGY y OpenCode")
+        print("  listar                      Lista todas las cuentas guardadas de Codex, AGY y OpenCode (offline)")
+        print("  usar <nombre>               Cambia a la cuenta indicada (detecta Codex, AGY u OpenCode)")
         print("  actualizar                  Actualiza la suite Switch, OpenAI Codex y Antigravity CLI")
         print("                              (opciones: --switch, --codex, --agy)")
         print("  version                     Muestra las versiones instaladas de Switch, Codex y AGY")
         print("\nComandos por herramienta:")
         print("  switch codex [subcomando]   Ejecuta comandos de codex-switch (status, usar, agregar, etc.)")
         print("  switch agy [subcomando]     Ejecuta comandos de agy-switch (status, usar, agregar, etc.)")
+        print("  switch opencode [subcomando] Ejecuta comandos de opencode-switch (status, usar, login, etc.)")
         print("\nEjemplos:")
         print("  switch tray --autostart enable")
         print("  switch actualizar")

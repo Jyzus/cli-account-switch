@@ -135,12 +135,13 @@ def test_switch_preflight_json(isolated_env):
     assert caps.get("active_session_detection") is True
     assert caps.get("refresh_persistence_errors") is True
 
-    # Proveedores y OpenCode como no implementado
+    # Proveedores y OpenCode ahora soportado (telemetría local, sin ejecución paralela)
     provs = data["proveedores"]
     assert provs["codex"]["soportado"] is True
     assert provs["agy"]["soportado"] is True
-    assert provs["opencode"]["soportado"] is False
-    assert provs["opencode"]["razon"] == "adaptador_no_implementado"
+    assert provs["opencode"]["soportado"] is True
+    assert provs["opencode"]["active_session_detection"] is True
+    assert provs["opencode"]["local_token_telemetry"] is True
 
 
 def test_cuentas_identidad_opaca(isolated_env):

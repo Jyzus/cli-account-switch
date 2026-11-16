@@ -1,6 +1,6 @@
 # CLI Account Switch
 
-Gestores de perfiles locales para **Codex CLI** (`codex-switch`) y **Antigravity CLI** (`agy-switch`), acompañados de un **Widget de Barra de Tareas / Bandeja del Sistema ultraligero** (`switch-tray`) y un **Desktop Dashboard flotante** (`switch-widget`). Guarda una autenticación con un alias, cambia de perfil en 1 clic, monitorea cuotas en tiempo real con mínimo consumo y reanuda tus conversaciones desde la terminal o desde tu entorno de escritorio.
+Gestores de perfiles locales para **Codex CLI** (`codex-switch`), **Antigravity CLI** (`agy-switch`) y **OpenCode** (`opencode-switch`), acompañados de un **Widget de Barra de Tareas / Bandeja del Sistema ultraligero** (`switch-tray`) y un **Desktop Dashboard flotante** (`switch-widget`). Guarda una autenticación con un alias, cambia de perfil en 1 clic, monitorea cuotas y consumo de tokens en tiempo real con mínimo consumo y reanuda tus conversaciones desde la terminal o desde tu entorno de escritorio.
 
 Proyecto independiente, sin afiliación con los proveedores de las herramientas.
 
@@ -202,6 +202,16 @@ agy-switch paralelo cuenta2 -- agy -p "tarea" # ejecución paralela aislada (sin
 agy-switch continuar
 agy-switch version               # consulta versión instalada (alias: --version, -v)
 agy-switch actualizar            # actualiza la suite a la última versión (alias: update)
+
+# Para OpenCode (multi-cuenta nativa vía 'opencode auth' + telemetría local):
+opencode-switch status           # consumo de tokens y coste por proveedor/modelo (alias: cuota, tokens)
+opencode-switch status "OpenCode Console"
+opencode-switch listar           # lista las cuentas guardadas de OpenCode (alias: cuentas)
+opencode-switch login trabajo    # conecta una cuenta nueva con 'opencode auth login'
+opencode-switch usar trabajo     # activa una cuenta con 'opencode auth switch' (--force)
+opencode-switch reautenticar trabajo  # reautentica una cuenta existente
+opencode-switch eliminar trabajo # cierra sesión/elimina una cuenta (alias: logout, rm)
+opencode-switch version
 ```
 
 También se aceptan `save`, `rm`, `borrar`, `quitar`, `delete`, `mv`, `rename`, `new`, `list`, `use`, `resume`, `cuota`, `quota` y `usage`. Ejecutar el comando sin argumentos (`codex-switch` o `agy-switch`) consulta el estado en vivo de todas las cuentas. `id` muestra el identificador de la última conversación detectada; `continuar <id>` permite elegir una explícitamente.
@@ -213,6 +223,7 @@ Los alias admiten de 1 a 64 caracteres: letras ASCII, números, puntos, guiones 
 El comando `status` (o `tokens`, `cuota`, `usage`) consulta en tiempo real y en paralelo las APIs oficiales de OpenAI / Google para cada cuenta guardada:
 - **Codex CLI**: Muestra ventana de 5 horas (o semanal), porcentaje usado/restante con barras visuales, tiempo exacto hasta el próximo reseteo, créditos de reset disponibles y si la cuenta está lista o agotada.
 - **Antigravity CLI**: Muestra la cuota restante de modelos Gemini y de terceros (Claude / GPT), tiempo de refresco y plan/tier activo.
+- **OpenCode**: Muestra el consumo acumulado real de tokens (entrada/salida/razonamiento/caché) y el coste, desglosado por proveedor y modelo, leído de la base de datos local de OpenCode.
 - **Auto-refresco inteligente**: Si un token de acceso OAuth expiró pero posee un refresh token válido, se refresca y actualiza automáticamente en disco sin requerir re-login manual.
 - **Detección de cuentas listas**: Resalta qué perfiles tienen tokens disponibles para que sepas a cuál cambiar al instante.
 
@@ -270,15 +281,16 @@ switch seleccionar codex secundaria --json
    - `invalid_auth`: Credenciales expiradas o inválidas que requieren re-autenticación humana.
    - `network_error`: Problema de conectividad, timeout o error 5xx con la API del proveedor.
    - `unknown_quota`: La API remota no devolvió información de saldo interpretable.
-   - `unsupported_capability`: Capacidad o proveedor no implementado (ej. OpenCode).
+   - `unsupported_capability`: Capacidad o proveedor no implementado (p. ej. saldo/cuota externa o ejecución paralela).
    - `lock_failed`: Contienda de concurrencia al intentar adquirir el bloqueo atómico `switch.lock`.
-4. **Soporte Transparente de OpenCode**: Si se consulta `opencode`, Switch devuelve explícitamente `disponible: false` y `capacidad: "unsupported_capability"`, sin inventar saldo ni deshabilitar el runner en el planeador.
+4. **Soporte de OpenCode**: `opencode` cuenta con su propio adaptador (`opencode-switch`). Como OpenCode no expone un endpoint de saldo/cuota, reporta el **consumo real de tokens y coste** leído de su base local (`opencode.db`) y devuelve `saldo`/`rate_limit` en `null` (nunca inventa cuota).
 
 
 ## Datos y comportamiento
 
 - Codex: usa `$CODEX_HOME` o `~/.codex`. Los perfiles se guardan en `cuentas/*.json`.
 - Antigravity: usa `~/.gemini/antigravity-cli`. Los perfiles se guardan en `cuentas/*.token`.
+- OpenCode: usa su base de datos local `~/.local/share/opencode/opencode.db` (configurable con `OPENCODE_DB`). Las cuentas se gestionan de forma nativa con `opencode auth`; el consumo de tokens/coste se lee de las tablas de sesiones.
 - **Compatibilidad con GNOME Keyring en Linux**: Antigravity CLI en entornos de escritorio Linux almacena por defecto sus credenciales en el Secret Service del sistema (GNOME Keyring / libsecret). `agy-switch` detecta y sincroniza automáticamente las credenciales entre el Keyring del sistema y el archivo de tokens local (`~/.gemini/antigravity-cli/antigravity-oauth-token`), permitiendo guardar, consultar y alternar perfiles sin discrepancias tanto en entornos gráficos de escritorio como en servidores headless.
 - **Agregar cuentas en entorno aislado sin interrumpir sesiones (`agregar`)**: Con `codex-switch agregar <alias>` y `agy-switch agregar <alias>` (alias: `add`), puedes autenticar y registrar cuentas adicionales para que aparezcan en tu panel de monitoreo (`switch-widget`, `switch-tray` y `status`) **sin tener que cerrar tus chats abiertos ni cambiar de cuenta activa**. La autenticación se ejecuta en un sandbox temporal aislado que no toca tu sesión activa ni archivos en uso. Además, soporta `--desde <archivo_o_json>` para importar credenciales directas sin abrir navegador.
 - **Protección contra perfiles duplicados y sobrescrituras**: Al ejecutar `guardar <alias>`, el sistema verifica automáticamente si la cuenta activa ya se encuentra guardada bajo otro perfil. Si ya existe, bloquea la duplicación innecesaria y sugiere renombrarlo con `renombrar` o forzarlo con `--force`. Asimismo, si el alias ya pertenece a otra cuenta diferente, previene la sobrescritura accidental a menos que se indique `--force`.
@@ -297,9 +309,10 @@ Estos scripts dependen de rutas y formatos internos de las CLI, que pueden cambi
 
 Puedes consultar la versión instalada de cada componente en cualquier momento con:
 ```bash
-switch version            # Muestra versiones de Switch, Codex y AGY
+switch version            # Muestra versiones de Switch, Codex, AGY y OpenCode
 codex-switch version      # o: codex-switch --version / -v
 agy-switch version        # o: agy-switch --version / -v
+opencode-switch version   # o: opencode-switch --version / -v
 switch-widget --version
 switch-tray --version
 ```
@@ -311,7 +324,7 @@ switch-tray --version
 switch actualizar
 ```
 *Actualiza de forma inteligente:*
-1. **CLI Account Switch** (`switch`, `codex-switch`, `agy-switch`, `switch-widget`, `switch-tray`) a la última versión de GitHub.
+1. **CLI Account Switch** (`switch`, `codex-switch`, `agy-switch`, `opencode-switch`, `switch-widget`, `switch-tray`) a la última versión de GitHub.
 2. **OpenAI Codex CLI** mediante `codex update`.
 3. **Google Antigravity CLI** mediante `agy update`.
 
@@ -328,7 +341,7 @@ git pull --ff-only
 ./install.sh
 ```
 
-Para desinstalar, elimina `switch`, `codex-switch`, `agy-switch`, `switch-widget` y `switch-tray` del directorio de instalación (`~/.local/bin`). Tus perfiles e historiales permanecen en sus directorios de configuración.
+Para desinstalar, elimina `switch`, `codex-switch`, `agy-switch`, `opencode-switch`, `switch-widget` y `switch-tray` del directorio de instalación (`~/.local/bin`). Tus perfiles e historiales permanecen en sus directorios de configuración.
 
 ## Integración de Nuevos Agentes y Proveedores (DeepSeek, OpenCode, etc.)
 
